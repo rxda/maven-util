@@ -236,7 +236,9 @@ fn upload_file(
     db: &Database,
 ) -> Result<()> {
     let group_path = artifact.group_id.replace('.', "/");
-    let file_name = format!("{}-{}.{}", artifact.artifact_id, artifact.version, remote_ext);
+    let file_name = file_path.file_name()
+        .context("无法获取文件名")?
+        .to_string_lossy();
     let target_url = format!("{}{}/{}/{}/{}", base_url, group_path, artifact.artifact_id, artifact.version, file_name);
 
     let mtime = fs::metadata(file_path)?.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
