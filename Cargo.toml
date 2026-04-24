@@ -9,8 +9,6 @@ clap = { version = "4.4", features = ["derive", "env"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json","rustls-tls-manual-roots-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 webpki-roots = "1.0.4"   # 根证书
-roxmltree = "0.21"
-walkdir = "2.4"
 url = "2.5"
 rayon = "1.8"
 jwalk = "0.8"

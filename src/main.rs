@@ -8,7 +8,7 @@ use rayon::iter::{ParallelBridge, ParallelIterator};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use reqwest::blocking::Client;
 use rustls::{ClientConfig, RootCertStore};
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -108,11 +108,32 @@ fn main() -> Result<()> {
             .context("无法打开/创建 redb 数据库")?
     );
     // 初始化表结构
-    {
-        let write_txn = db.begin_write()?;
-        { let _ = write_txn.open_table(TABLE)?; }
-        write_txn.commit()?;
-    }
+    // 1.1 背景数据库写入线程
+    let (db_tx, db_rx) = unbounded::<(String, u64)>();
+    let db_writer_handle = {
+        let db_writer = Arc::clone(&db);
+        thread::spawn(move || {
+            while let Ok((key, mtime)) = db_rx.recv() {
+                let mut batch = vec![(key, mtime)];
+                // 尽量多取一点，攒够批量提交 (最多 100 条或直到管道空)
+                while batch.len() < 100 {
+                    if let Ok(msg) = db_rx.try_recv() {
+                        batch.push(msg);
+                    } else {
+                        break;
+                    }
+                }
+                if let Ok(write_txn) = db_writer.begin_write() {
+                    if let Ok(mut table) = write_txn.open_table(TABLE) {
+                        for (k, v) in batch {
+                            let _ = table.insert(k.as_str(), v);
+                        }
+                    }
+                    let _ = write_txn.commit();
+                }
+            }
+        })
+    };
 
     // 2. 规范化路径
     let root_path = fs::canonicalize(&args.dir).with_context(|| format!("路径无效: {}", args.dir))?;
@@ -131,7 +152,6 @@ fn main() -> Result<()> {
     let pb_scan = upload_pb.clone();
     let processed_ref = Arc::clone(&processed_poms);
     let root_ref = root_path.clone();
-
     thread::spawn(move || {
         WalkDir::new(&args_scan.dir)
             .parallelism(jwalk::Parallelism::RayonDefaultPool { busy_timeout: Duration::from_secs(1) })
@@ -154,10 +174,9 @@ fn main() -> Result<()> {
     });
 
     // 5. 上传逻辑 (消费者)
-    let client = create_pure_rust_client()?;
-    let client = Arc::new(client);
-    // 显式使用 Rayon 的桥接
+    let client = Arc::new(create_pure_rust_client()?);
     let parallel_iter = ParallelBridge::par_bridge(rx.into_iter());
+    
     ParallelIterator::for_each(parallel_iter, |artifact| {
         let is_snapshot = artifact.version.ends_with("-SNAPSHOT");
         let raw_url = if is_snapshot { args.snapshot_url.as_ref().unwrap_or(&args.url) } else { &args.url };
@@ -166,10 +185,13 @@ fn main() -> Result<()> {
         upload_pb.set_message(format!("{}:{}", artifact.artifact_id, artifact.version));
         
         for (f_path, remote_ext) in &artifact.files {
-            let _ = upload_file(&client, &base_url, &args, &artifact, f_path, remote_ext, &upload_pb, &db);
+            let _ = upload_file(&client, &base_url, &args, &artifact, f_path, remote_ext, &upload_pb, &db, &db_tx);
         }
         upload_pb.inc(1);
     });
+
+    drop(db_tx); // 关闭 Sender，使数据库线程结束
+    let _ = db_writer_handle.join();
 
     upload_pb.finish_with_message("✅ 任务完成");
     Ok(())
@@ -177,17 +199,25 @@ fn main() -> Result<()> {
 
 fn extract_full_artifact(pom_path: &Path, root_path: &Path) -> Result<MavenArtifact> {
     let abs_pom_path = fs::canonicalize(pom_path)?;
-    let relative_path = abs_pom_path.strip_prefix(root_path).map_err(|_| anyhow::anyhow!("路径不在根目录下"))?;
-    let components: Vec<String> = relative_path.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
+    let relative_path = abs_pom_path.strip_prefix(root_path)
+        .map_err(|_| anyhow::anyhow!("路径不在指定的根目录下: {:?}", abs_pom_path))?;
+    
+    let components: Vec<_> = relative_path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect();
 
-    if components.len() < 4 { return Err(anyhow::anyhow!("目录结构太浅")); }
+    let n = components.len();
+    if n < 4 { 
+        return Err(anyhow::anyhow!("无效的 Maven 目录结构: {:?}", relative_path)); 
+    }
 
-    let version = components[components.len() - 2].clone();
-    let artifact_id = components[components.len() - 3].clone();
-    let group_id = components[..components.len() - 3].join(".");
+    // components 例子: ["org", "example", "my-app", "1.0", "my-app-1.0.pom"]
+    let version = components[n - 2].to_string();
+    let artifact_id = components[n - 3].to_string();
+    let group_id = components[..n - 3].join(".");
 
     let prefix = format!("{}-{}", artifact_id, version);
-    let parent_dir = pom_path.parent().unwrap();
+    let parent_dir = pom_path.parent().context("无法获取父目录")?;
     let mut files = Vec::new();
 
     if let Ok(entries) = fs::read_dir(parent_dir) {
@@ -195,9 +225,12 @@ fn extract_full_artifact(pom_path: &Path, root_path: &Path) -> Result<MavenArtif
             let p = entry.path();
             if p.is_file() {
                 let fname = p.file_name().unwrap_or_default().to_string_lossy();
+                // 匹配以 artifact-version 开头的文件，排除临时文件
                 if fname.starts_with(&prefix) && !fname.contains("_remote.repositories") && !fname.ends_with(".lastUpdated") {
                     let ext = fname.get(prefix.len() + 1..).unwrap_or("").to_string();
-                    if !ext.is_empty() { files.push((p, ext)); }
+                    if !ext.is_empty() { 
+                        files.push((p, ext)); 
+                    }
                 }
             }
         }
@@ -234,6 +267,7 @@ fn upload_file(
     remote_ext: &str,
     pb: &ProgressBar,
     db: &Database,
+    db_tx: &crossbeam_channel::Sender<(String, u64)>,
 ) -> Result<()> {
     let group_path = artifact.group_id.replace('.', "/");
     let file_name = file_path.file_name()
@@ -255,18 +289,21 @@ fn upload_file(
             return Ok(()); 
         }
 
-        let resp = client.head(&target_url).basic_auth(&args.username, Some(&args.password)).send();
-        if let Ok(r) = resp {
+        let r_status = client.head(&target_url).basic_auth(&args.username, Some(&args.password)).send();
+        if let Ok(r) = r_status {
             if r.status().is_success() {
-                save_db_status(db, &target_url, mtime)?;
+                let _ = db_tx.send((target_url.clone(), mtime));
                 pb.println(format!("  [-] 远程已存在: {}", file_name));
                 return Ok(());
             }
         }
     }
 
-    let data = fs::read(file_path)?;
-    let put_resp = client.put(&target_url).basic_auth(&args.username, Some(&args.password)).body(data).send();
+    let file = File::open(file_path)?;
+    let put_resp = client.put(&target_url)
+        .basic_auth(&args.username, Some(&args.password))
+        .body(file)
+        .send();
 
     match put_resp {
         Ok(resp) => {
@@ -275,7 +312,7 @@ fn upload_file(
                 if !remote_ext.contains("sha1") && !remote_ext.contains("md5") {
                     pb.println(format!("  [+] 上传成功: {}", file_name));
                 }
-                save_db_status(db, &target_url, mtime)?;
+                let _ = db_tx.send((target_url, mtime));
             } else {
                 let msg = resp.text().unwrap_or_default();
                 pb.println(format!("  [❌] 失败 ({}): {} - {}", status, file_name, msg));
@@ -283,15 +320,5 @@ fn upload_file(
         }
         Err(e) => pb.println(format!("  [!] 网络错误: {}", e)),
     }
-    Ok(())
-}
-
-fn save_db_status(db: &Database, key: &str, mtime: u64) -> Result<()> {
-    let write_txn = db.begin_write()?;
-    {
-        let mut table = write_txn.open_table(TABLE)?;
-        table.insert(key, mtime)?;
-    }
-    write_txn.commit()?;
     Ok(())
 }
