@@ -1,0 +1,44 @@
+# maven-uploader 配置示例
+# 使用方式：
+#   maven-uploader -c maven-uploader.toml download
+#   maven-uploader -c maven-uploader.toml serve
+#
+# 命令行参数优先于配置文件中的同名配置。
+
+[download]
+# Maven 项目目录。相对路径相对于执行命令时的当前目录。
+workdir = "."
+
+# 下载依赖保存到此目录，同时会传给：
+# -Dmaven.repo.local=<目录>
+download_repo = "./maven-repo"
+server_repo = "~/.m2/repository"
+
+# 上游仓库按顺序尝试。
+upstreams = [
+  "https://repo.maven.apache.org/maven2",
+]
+
+# Maven 可执行文件。也可以填写项目中的 Maven Wrapper："./mvnw"
+maven = "./mvnw"
+
+# 追加到 mvn clean package 后面的参数。
+# 例如跳过测试：maven_args = ["-DskipTests"]
+maven_args = []
+
+# 只打印命令，不执行 Maven 构建。
+dry_run = false
+
+[serve]
+# 作为 Maven mirror 服务的本地仓库目录。
+# 支持 ~，例如 "~/.m2/repository"。
+dir = "~/.m2/repository"
+
+# 监听地址。127.0.0.1 只允许本机访问；局域网使用可改为 "0.0.0.0"。
+host = "127.0.0.1"
+port = 8080
+
+# 本地没有构件时按顺序回源。
+upstreams = [
+  "https://repo.maven.apache.org/maven2",
+]

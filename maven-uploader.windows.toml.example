@@ -1,0 +1,43 @@
+# maven-uploader Windows 配置示例
+# 复制为 maven-uploader.toml 后使用：
+#   maven-uploader.exe -c maven-uploader.toml download
+#   maven-uploader.exe -c maven-uploader.toml serve
+#
+# Windows 路径使用 TOML 字面量字符串（单引号），反斜杠无需转义。
+
+[download]
+# Maven 项目目录。也可以填写绝对路径，例如：
+# workdir = 'D:\workspace\my-project'
+workdir = '.'
+
+# 依赖保存目录，通过 -Dmaven.repo.local 传给 Maven。
+download_repo = '.\maven-repo'
+
+# 作为 mirror 服务根目录的已有 Maven 仓库。
+server_repo = 'C:\Users\你的用户名\.m2\repository'
+
+# 上游仓库按顺序尝试。
+upstreams = [
+  'https://repo.maven.apache.org/maven2',
+]
+
+# 未指定时，程序会优先寻找项目目录下的 .\mvnw.cmd；
+# 找不到 Wrapper 时，再使用 PATH 中的 mvn.cmd。
+# 如果需要显式指定 Maven Wrapper，可以取消下一行注释：
+# maven = '.\mvnw.cmd'
+
+# 追加到 mvn clean package 后面的参数。
+maven_args = []
+dry_run = false
+
+[serve]
+# 本地 Maven 仓库目录，例如用户目录下的默认仓库：
+dir = 'C:\Users\你的用户名\.m2\repository'
+
+# 仅本机访问；允许局域网访问可改为 '0.0.0.0'。
+host = '127.0.0.1'
+port = 8080
+
+upstreams = [
+  'https://repo.maven.apache.org/maven2',
+]
