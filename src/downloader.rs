@@ -166,9 +166,12 @@ impl TemporarySettings {
             std::process::id(),
             unique_suffix()
         ));
+        let mirror_url = server.base_url();
         let settings = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<settings xmlns=\"http://maven.apache.org/SETTINGS/1.0.0\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd\">\n  <mirrors>\n    <mirror>\n      <id>maven-uploader</id>\n      <name>maven-uploader local mirror</name>\n      <url>{}</url>\n      <mirrorOf>*</mirrorOf>\n    </mirror>\n  </mirrors>\n</settings>\n",
-            xml_escape(&server.base_url())
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<settings xmlns=\"http://maven.apache.org/SETTINGS/1.0.0\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd\">\n  <mirrors>\n    <mirror>\n      <id>maven-uploader</id>\n      <name>maven-uploader local mirror</name>\n      <url>{}</url>\n      <mirrorOf>*</mirrorOf>\n    </mirror>\n  </mirrors>\n  <profiles>\n    <profile>\n      <id>maven-uploader-repository</id>\n      <repositories>\n        <repository>\n          <id>maven-uploader-source</id>\n          <url>{}</url>\n          <releases><enabled>true</enabled></releases>\n          <snapshots><enabled>true</enabled></snapshots>\n        </repository>\n      </repositories>\n      <pluginRepositories>\n        <pluginRepository>\n          <id>maven-uploader-plugin-source</id>\n          <url>{}</url>\n          <releases><enabled>true</enabled></releases>\n          <snapshots><enabled>true</enabled></snapshots>\n        </pluginRepository>\n      </pluginRepositories>\n    </profile>\n  </profiles>\n  <activeProfiles>\n    <activeProfile>maven-uploader-repository</activeProfile>\n  </activeProfiles>\n</settings>\n",
+            xml_escape(&mirror_url),
+            xml_escape(&mirror_url),
+            xml_escape(&mirror_url)
         );
         fs::write(&path, settings).context("无法创建临时 Maven settings.xml")?;
         Ok(Self { path })

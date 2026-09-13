@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
 use std::{
     fs::{self, File},
-    io::{self, BufReader, Read, Write},
+    io::{self, BufReader, Cursor, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
@@ -77,6 +77,21 @@ impl Body {
             Self::File(_, length) => *length,
             Self::Bytes(bytes) => bytes.len() as u64,
         }
+    }
+}
+
+fn sha1_body(body: Body) -> io::Result<String> {
+    match body {
+        Body::File(mut file, _) => sha1_hex(&mut file),
+        Body::Bytes(bytes) => sha1_hex(&mut Cursor::new(bytes)),
+    }
+}
+
+fn checksum_response(checksum: String) -> Response {
+    Response {
+        status: "200 OK",
+        content_type: "text/plain; charset=utf-8",
+        body: Body::Bytes(format!("{checksum}\n").into_bytes()),
     }
 }
 
@@ -374,7 +389,21 @@ impl Repository {
         *last = checksum.to_string();
         let artifact_path = match self.safe_path(&artifact_components) {
             Ok(path) => path,
-            Err(error) if error.to_string() == "not found" => return Ok(None),
+            Err(error) if error.to_string() == "not found" => {
+                // maven-metadata.xml can be generated from the local Maven
+                // directory when no physical file exists. Maven also asks
+                // for its .sha1, so hash the generated response as well.
+                if artifact_components.last().map(String::as_str) == Some("maven-metadata.xml") {
+                    let response = match self.generate_metadata(&artifact_components) {
+                        Ok(response) => response,
+                        Err(error) if error.to_string() == "not found" => return Ok(None),
+                        Err(error) => return Err(error),
+                    };
+                    let checksum = sha1_body(response.body).context("计算 SHA-1 校验值失败")?;
+                    return Ok(Some(checksum_response(checksum)));
+                }
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         };
         let mut file = match File::open(&artifact_path) {
@@ -383,11 +412,7 @@ impl Repository {
             Err(error) => return Err(anyhow!(error).context("打开待校验文件失败")),
         };
         let checksum = sha1_hex(&mut file).context("计算 SHA-1 校验值失败")?;
-        Ok(Some(Response {
-            status: "200 OK",
-            content_type: "text/plain; charset=utf-8",
-            body: Body::Bytes(format!("{checksum}\n").into_bytes()),
-        }))
+        Ok(Some(checksum_response(checksum)))
     }
 
     fn fetch_from_upstreams(&self, components: &[String]) -> Result<Response> {
