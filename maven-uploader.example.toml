@@ -1,7 +1,7 @@
 # maven-uploader 配置示例
 # 使用方式：
-#   maven-uploader -c maven-uploader.toml download
-#   maven-uploader -c maven-uploader.toml serve
+#   maven-util -c maven-uploader.toml download
+#   maven-util -c maven-uploader.toml serve
 #
 # 命令行参数优先于配置文件中的同名配置。
 

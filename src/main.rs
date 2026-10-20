@@ -25,8 +25,8 @@ const TABLE: TableDefinition<&str, u64> = TableDefinition::new("uploads_v1");
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "高性能 Maven 仓库迁移工具 (Pure Rust 版)")]
 struct Args {
-    /// TOML 配置文件，可放在命令前或子命令后
-    #[arg(short = 'c', long, global = true)]
+    /// TOML 配置文件，可放在命令前或子命令后；未指定时自动查找默认配置
+    #[arg(short = 'c', long, global = true, env = "MAVEN_UTIL_CONFIG")]
     config: Option<PathBuf>,
     /// Release 仓库 URL
     #[arg(short = 'U', long, env = "NEXUS_URL")]
@@ -128,6 +128,9 @@ struct DownloadCli {
     /// Maven 可执行文件；未指定时优先使用项目中的 mvnw/mvnw.cmd
     #[arg(long)]
     maven: Option<PathBuf>,
+    /// 跳过测试执行（向 Maven 追加 -DskipTests）
+    #[arg(short = 's', long)]
+    skip_tests: bool,
     /// 仅打印将要执行的 Maven 命令
     #[arg(long)]
     dry_run: bool,
@@ -199,6 +202,9 @@ fn main() -> Result<()> {
         let download_config = file_config.download.unwrap_or_default();
         let mut maven_args = download_config.maven_args.unwrap_or_default();
         maven_args.extend(cli.maven_args);
+        if cli.skip_tests && !maven_args.iter().any(|arg| arg == "-DskipTests") {
+            maven_args.push("-DskipTests".into());
+        }
         return downloader::run_download(downloader::DownloadArgs {
             workdir: cli
                 .workdir

@@ -1,4 +1,4 @@
-# maven-uploader
+# maven-util
 
 一个用 Rust 编写的 Maven 工具，支持：
 
@@ -12,14 +12,14 @@
 递归删除默认 Maven 仓库中的 `_remote.repositories` 和 `*.lastUpdated` 文件：
 
 ```bash
-maven-uploader clean
+maven-util clean
 ```
 
 指定仓库目录，或先使用 `--dry-run` 预览：
 
 ```bash
-maven-uploader clean --repo /path/to/.m2/repository
-maven-uploader clean --dry-run
+maven-util clean --repo /path/to/.m2/repository
+maven-util clean --dry-run
 ```
 
 该命令不会删除 JAR、POM、元数据或目录。
@@ -30,14 +30,28 @@ maven-uploader clean --dry-run
 cargo build --release
 ```
 
-生成的程序位于 `target/release/maven-uploader`。
+生成的程序位于 `target/release/maven-util`。
 
 ## 配置文件
 
-`download` 和 `serve` 都支持通过 `-c/--config` 指定 TOML 配置文件，命令行参数优先级高于配置文件：
+`download` 和 `serve` 不再要求必须传 `-c/--config`。未指定配置路径时，会按以下顺序查找第一个存在的文件：
+
+1. 当前目录的 `maven-uploader.toml`
+2. 当前目录的 `maven-uploader.example.toml`
+3. 可执行文件所在目录中的同名配置
+4. 编译本程序的 `maven-util` 源码目录中的同名配置
+
+因此在 `maven-util` 目录中可以直接执行：
 
 ```bash
-maven-uploader download --config maven-uploader.toml
+maven-util download
+```
+
+也可以在其他 Maven 项目目录放置自己的 `maven-uploader.toml`。仍可通过 `-c/--config` 或环境变量 `MAVEN_UTIL_CONFIG` 显式指定配置，命令行参数优先级高于配置文件：
+
+```bash
+maven-util download --config /path/to/maven-uploader.toml
+MAVEN_UTIL_CONFIG=/path/to/maven-uploader.toml maven-util download
 ```
 
 配置示例：
@@ -74,8 +88,23 @@ mvn clean package -Dmaven.repo.local=<下载仓库>
 
 Maven 自己负责解析 parent、parent 的 parent、BOM、插件和传递依赖，因此不会遗漏 parent POM。`download` 会把 `server_repo`（默认 `~/.m2/repository`）启动为内置 mirror 的仓库根目录，Maven 通过 `-Dmaven.repo.local` 将新下载的依赖保存到目标 `download_repo`。
 
+`clean package` 只会下载本次构建生命周期实际执行的插件。为补齐 POM 中声明但未参与默认构建的插件，构建成功后程序还会：
+
+1. 执行 `maven-help-plugin:effective-pom`，收集继承、`pluginManagement` 和未激活 profile 中的全部插件声明；
+2. 对尚未缓存的插件逐个执行 `maven-help-plugin:describe`，下载插件 JAR、POM 及其传递依赖。
+
+该流程不使用 `dependency:go-offline`。全部完成后，程序会递归删除 `download_repo` 中由 Maven 生成的 `_remote.repositories` 和 `*.lastUpdated` 文件。
+
+使用仓库根目录的默认 `maven-uploader.toml` 时，最短命令是：
+
 ```bash
-maven-uploader download . \
+maven-util download
+```
+
+也可以显式覆盖配置中的参数：
+
+```bash
+maven-util download . \
   --download-repo ./maven-repo \
   --upstream https://repo.maven.apache.org/maven2
 ```
@@ -83,7 +112,7 @@ maven-uploader download . \
 也可以指定多个上游仓库，按顺序尝试：
 
 ```bash
-maven-uploader download . \
+maven-util download . \
   --download-repo ./maven-repo \
   --upstream https://nexus.example.com/repository/maven-public \
   --upstream https://repo.maven.apache.org/maven2
@@ -97,6 +126,7 @@ maven-uploader download . \
     --server-repo <DIR>     mirror 服务仓库，默认 ~/.m2/repository
     --upstream <URL,...>     上游仓库，可重复指定
     --maven <FILE>           Maven 可执行文件；未指定时优先使用项目中的 mvnw/mvnw.cmd
+-s, --skip-tests              跳过测试执行，向 Maven 追加 -DskipTests
     --dry-run                仅显示命令，不执行构建
 ```
 
@@ -105,15 +135,23 @@ maven-uploader download . \
 `download` 还支持在命令末尾追加 Maven 参数，例如：
 
 ```bash
-maven-uploader download . --download-repo ./maven-repo -- -DskipTests
+maven-util download . --download-repo ./maven-repo -- -DskipTests
 ```
+
+也可以直接使用专门的选项：
+
+```bash
+maven-util download . --download-repo ./maven-repo --skip-tests
+```
+
+`--skip-tests` 等价于在 Maven 参数中追加 `-DskipTests`，会跳过测试执行，但仍会编译测试代码。
 
 ## 上传本地 Maven 仓库
 
 上传模式不使用 `download` 子命令：
 
 ```bash
-maven-uploader \
+maven-util \
   --url https://nexus.example.com/repository/releases \
   --username admin \
   --password 'your-password' \
@@ -139,7 +177,7 @@ maven-uploader \
 把本地 Maven 仓库按 Maven 仓库协议提供给 Maven、Gradle 或其他构建工具：
 
 ```bash
-maven-uploader serve \
+maven-util serve \
   --dir ~/.m2/repository \
   --host 127.0.0.1 \
   --port 8080
@@ -150,7 +188,7 @@ maven-uploader serve \
 上游仓库可以通过 `--upstream` 指定多个：
 
 ```bash
-maven-uploader serve \
+maven-util serve \
   --dir ~/.m2/repository \
   --upstream https://nexus.example.com/repository/maven-public \
   --upstream https://repo.maven.apache.org/maven2

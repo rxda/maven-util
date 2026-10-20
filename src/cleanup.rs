@@ -74,4 +74,34 @@ mod tests {
         assert!(!is_cleanup_file(Path::new("artifact.pom")));
         assert!(!is_cleanup_file(Path::new("artifact.jar")));
     }
+
+    #[test]
+    fn run_cleanup_removes_only_state_files() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let root = std::env::temp_dir().join(format!(
+            "maven-util-cleanup-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let artifact_dir = root.join("org/example/demo/1.0");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        fs::write(artifact_dir.join("demo-1.0.jar"), b"jar").unwrap();
+        fs::write(artifact_dir.join("_remote.repositories"), b"remote").unwrap();
+        fs::write(artifact_dir.join("demo-1.0.jar.lastUpdated"), b"update").unwrap();
+
+        run_cleanup(CleanupArgs {
+            repo: root.clone(),
+            dry_run: false,
+        })
+        .unwrap();
+
+        assert!(artifact_dir.join("demo-1.0.jar").is_file());
+        assert!(!artifact_dir.join("_remote.repositories").exists());
+        assert!(!artifact_dir.join("demo-1.0.jar.lastUpdated").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 }
