@@ -11,7 +11,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::server::{self, ServerArgs, ServerHandle};
+use crate::server::{self, CacheLimits, ServerArgs, ServerHandle};
 
 #[derive(Debug, Clone)]
 pub struct DownloadArgs {
@@ -22,17 +22,8 @@ pub struct DownloadArgs {
     pub maven: Option<PathBuf>,
     pub maven_args: Vec<String>,
     pub dry_run: bool,
+    pub cache: CacheLimits,
     pub client: Arc<Client>,
-}
-
-pub fn default_server_repo() -> PathBuf {
-    #[cfg(windows)]
-    let home = env::var_os("USERPROFILE");
-    #[cfg(not(windows))]
-    let home = env::var_os("HOME");
-
-    home.map(|path| PathBuf::from(path).join(".m2/repository"))
-        .unwrap_or_else(|| PathBuf::from(".m2/repository"))
 }
 
 pub fn run_download(args: DownloadArgs) -> Result<()> {
@@ -41,39 +32,38 @@ pub fn run_download(args: DownloadArgs) -> Result<()> {
     if !workdir.is_dir() {
         return Err(anyhow!("Maven 运行路径不是目录: {}", workdir.display()));
     }
-
-    let download_repo = absolute_path(&args.download_repo, &workdir);
-    fs::create_dir_all(&download_repo)
-        .with_context(|| format!("无法创建依赖下载目录: {}", download_repo.display()))?;
     if args.upstreams.is_empty() {
         return Err(anyhow!("至少需要一个 --upstream 上游仓库"));
     }
 
+    // 这些路径在真正执行前只做解析，不创建任何目录。
+    let download_repo = absolute_path(&args.download_repo, &workdir);
     let server_repo = absolute_path(&args.server_repo, &workdir);
+    let maven = resolve_maven(args.maven.clone(), &workdir);
+
+    // --dry-run 只打印将要执行的内容，不创建目录、不启动服务、不写临时文件。
+    if args.dry_run {
+        print_dry_run(&workdir, &download_repo, &server_repo, &maven, &args);
+        return Ok(());
+    }
+
+    fs::create_dir_all(&download_repo)
+        .with_context(|| format!("无法创建依赖下载目录: {}", download_repo.display()))?;
     fs::create_dir_all(&server_repo)
         .with_context(|| format!("无法创建 Maven mirror 仓库: {}", server_repo.display()))?;
+
     let server = server::start_server(ServerArgs {
         root: server_repo,
         host: "127.0.0.1".into(),
         port: 0,
         upstreams: args.upstreams.clone(),
         client: args.client,
+        cache: args.cache,
     })?;
     let settings = TemporarySettings::create(&server)?;
 
-    let maven = resolve_maven(args.maven, &workdir);
     let mut command = maven_command(&maven, &workdir, settings.path(), &download_repo);
     command.arg("clean").arg("package").args(&args.maven_args);
-
-    if args.dry_run {
-        println!("工作目录: {}", workdir.display());
-        println!("依赖下载目录: {}", download_repo.display());
-        println!("Mirror 仓库: {}", args.server_repo.display());
-        println!("Mirror URL: {}", server.base_url());
-        println!("上游仓库: {}", args.upstreams.join(", "));
-        println!("命令: {:?}", command);
-        return Ok(());
-    }
 
     println!("Maven mirror 已启动: {}", server.base_url());
     println!("运行 Maven: {}", workdir.display());
@@ -125,6 +115,30 @@ pub fn run_download(args: DownloadArgs) -> Result<()> {
 
     println!("Maven 构建完成，依赖下载目录: {}", download_repo.display());
     Ok(())
+}
+
+/// `--dry-run`：只打印计划，不产生任何副作用（不建目录、不监听端口、
+/// 不写临时 settings.xml）。
+fn print_dry_run(
+    workdir: &Path,
+    download_repo: &Path,
+    server_repo: &Path,
+    maven: &Path,
+    args: &DownloadArgs,
+) {
+    println!("工作目录: {}", workdir.display());
+    println!("依赖下载目录: {} (不会创建)", download_repo.display());
+    println!("Mirror 仓库: {} (不会创建)", server_repo.display());
+    println!("Mirror URL: <启动后分配的随机端口>");
+    println!("上游仓库: {}", args.upstreams.join(", "));
+    let mut command = maven_command(
+        maven,
+        workdir,
+        Path::new("<临时 settings.xml>"),
+        download_repo,
+    );
+    command.arg("clean").arg("package").args(&args.maven_args);
+    println!("命令: {command:?}");
 }
 
 fn maven_command(maven: &Path, workdir: &Path, settings: &Path, download_repo: &Path) -> Command {
@@ -399,10 +413,11 @@ fn parse_declared_plugins(xml: &str) -> Result<Vec<MavenPlugin>> {
                 path.push(tag.name);
             }
             XmlTagKind::Empty => {
-                if tag.name == "plugin" && is_plugin_container_parent(&path) {
-                    if let Some(plugin) = parse_plugin_block(&xml[tag.start..tag.end])? {
-                        blocks.push(plugin);
-                    }
+                if tag.name == "plugin"
+                    && is_plugin_container_parent(&path)
+                    && let Some(plugin) = parse_plugin_block(&xml[tag.start..tag.end])?
+                {
+                    blocks.push(plugin);
                 }
             }
             XmlTagKind::End => {

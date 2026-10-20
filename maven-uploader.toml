@@ -1,5 +1,7 @@
-# maven-util 默认配置
-# 未指定 -c/--config 时会自动查找本文件，因此可直接执行：
+# maven-util 项目级配置
+# 位于当前目录时会逐字段覆盖 ~/.maven-util/config.toml：
+# 未写到的段或字段仍然取全局配置，因此这里只写本项目需要覆盖的项即可。
+#
 #   maven-util download
 #   maven-util serve
 #

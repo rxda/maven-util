@@ -1,6 +1,6 @@
 [package]
 name = "maven-util"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -8,17 +8,19 @@ anyhow = "1.0"
 clap = { version = "4.4", features = ["derive", "env"] }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json","rustls-tls-manual-roots-no-provider"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-manual-roots-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 webpki-roots = "1.0.4"   # 根证书
-url = "2.5"
 rayon = "1.8"
 jwalk = "0.8"
 indicatif = "0.18"
 crossbeam-channel = "0.5"
 dashmap = "6.1"
 redb = "3.1"
+# 注意：alpha 依赖，默认保留纯 Rust TLS（不引入 C 代码）。如需改为稳定提供者，
+# 可换用 rustls 的 ring/aws-lc-rs provider，见 README「依赖说明」。
 rustls-rustcrypto = "0.0.2-alpha"
+sha1 = "0.10"            # Maven checksum 计算，替代手写 SHA-1
 
 [profile.release]
 # 1. 优化级别：'z' 专门优化体积，'s' 兼顾速度和体积

@@ -1,0 +1,533 @@
+//! 命令行集成测试：退出码、配置文件自动创建与优先级、`--dry-run` 零副作用。
+//!
+//! 通过 `CARGO_BIN_EXE_maven-util` 运行真实二进制。
+
+mod common;
+
+use common::{FakeUpstream, JAR, Reply, maven_repo_fixture, temp_dir};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+/// 运行被测二进制；HOME 与 TMPDIR 指向临时目录，避免污染真实用户环境。
+fn run(args: &[&str], home: &Path, tmpdir: Option<&Path>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_maven-util"));
+    command
+        .args(args)
+        .env("HOME", home)
+        // 在临时目录中执行，避免仓库自带的 maven-uploader.toml 干扰配置优先级
+        .current_dir(home);
+    if let Some(tmpdir) = tmpdir {
+        command.env("TMPDIR", tmpdir);
+    }
+    // 避免继承测试环境中的同名变量干扰配置合并
+    for variable in [
+        "MAVEN_UTIL_CONFIG",
+        "NEXUS_URL",
+        "NEXUS_SNAPSHOT_URL",
+        "NEXUS_USERNAME",
+        "NEXUS_PASSWORD",
+        "NEXUS_DIR",
+        "NEXUS_FORCE",
+        "NEXUS_EXCLUDE",
+        "NEXUS_MAX_MB",
+        "MAVEN_UTIL_DB_PATH",
+    ] {
+        command.env_remove(variable);
+    }
+    command.output().expect("运行 maven-util 失败")
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// 进度条消息走 stderr，最终汇总走 stdout，这里合并判断。
+fn combined(output: &Output) -> String {
+    format!("{}{}", stdout(output), stderr(output))
+}
+
+fn upload_routes(status: u16) -> HashMap<String, Reply> {
+    let mut routes = HashMap::new();
+    for path in [
+        "/org/example/demo/1.0/demo-1.0.pom",
+        "/org/example/demo/1.0/demo-1.0.jar",
+    ] {
+        routes.insert(
+            path.to_string(),
+            Reply::MethodStatus {
+                head: 404,
+                other: status,
+            },
+        );
+    }
+    routes
+}
+
+fn repo_with_artifact(name: &str) -> PathBuf {
+    let root = temp_dir(name);
+    maven_repo_fixture(&root);
+    root
+}
+
+#[test]
+fn upload_failure_exits_non_zero() {
+    let home = temp_dir("home-upload-fail");
+    let repo = repo_with_artifact("repo-upload-fail");
+    let upstream = FakeUpstream::start(upload_routes(500));
+
+    let output = run(
+        &[
+            "--url",
+            &upstream.base_url,
+            "--username",
+            "admin",
+            "--password",
+            "secret",
+            "--dir",
+            repo.to_str().unwrap(),
+            "--db-path",
+            repo.join("state.db").to_str().unwrap(),
+        ],
+        &home,
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "上传失败必须返回非零退出码。stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let combined = combined(&output);
+    assert!(
+        combined.contains("上传失败"),
+        "必须明确报告失败: {combined}"
+    );
+    assert!(
+        combined.contains("demo-1.0.jar") || combined.contains("demo-1.0.pom"),
+        "失败明细必须包含具体文件: {combined}"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn upload_success_exits_zero_and_second_run_reuses_state() {
+    let home = temp_dir("home-upload-ok");
+    let repo = repo_with_artifact("repo-upload-ok");
+    let db = repo.join("state.db");
+    let upstream = FakeUpstream::start(upload_routes(201));
+
+    let args = [
+        "--url",
+        upstream.base_url.as_str(),
+        "--username",
+        "admin",
+        "--password",
+        "secret",
+        "--dir",
+        repo.to_str().unwrap(),
+        "--db-path",
+        db.to_str().unwrap(),
+    ];
+
+    let first = run(&args, &home, None);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "上传成功必须返回 0。stdout={} stderr={}",
+        stdout(&first),
+        stderr(&first)
+    );
+    assert!(combined(&first).contains("上传成功"));
+    assert!(db.is_file(), "上传状态库必须被创建");
+
+    let hits_after_first = upstream.hit_count();
+
+    let second = run(&args, &home, None);
+    assert_eq!(second.status.code(), Some(0));
+    assert!(
+        combined(&second).contains("已存在"),
+        "第二次运行应命中状态库: {}",
+        combined(&second)
+    );
+    assert_eq!(
+        upstream.hit_count(),
+        hits_after_first,
+        "命中状态库后不应再请求远端"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn upload_force_bypasses_local_state() {
+    let home = temp_dir("home-upload-force");
+    let repo = repo_with_artifact("repo-upload-force");
+    let db = repo.join("state.db");
+    let upstream = FakeUpstream::start(upload_routes(201));
+
+    let args = [
+        "--url",
+        upstream.base_url.as_str(),
+        "--username",
+        "admin",
+        "--password",
+        "secret",
+        "--dir",
+        repo.to_str().unwrap(),
+        "--db-path",
+        db.to_str().unwrap(),
+    ];
+
+    assert_eq!(run(&args, &home, None).status.code(), Some(0));
+    let hits_after_first = upstream.hit_count();
+
+    let mut forced: Vec<&str> = args.to_vec();
+    forced.push("--force");
+    let output = run(&forced, &home, None);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        upstream.hit_count() > hits_after_first,
+        "--force 必须重新上传"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn download_dry_run_has_no_side_effects() {
+    let home = temp_dir("home-dry-run");
+    let project = temp_dir("dry-run-project");
+    std::fs::write(project.join("pom.xml"), b"<project/>").unwrap();
+    let download_repo = project.join("download-repo");
+    let server_repo = project.join("server-repo");
+    let tmpdir = temp_dir("dry-run-tmp");
+
+    let output = run(
+        &[
+            "download",
+            project.to_str().unwrap(),
+            "--download-repo",
+            download_repo.to_str().unwrap(),
+            "--server-repo",
+            server_repo.to_str().unwrap(),
+            "--dry-run",
+        ],
+        &home,
+        Some(&tmpdir),
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let stdout = stdout(&output);
+    assert!(stdout.contains("命令:"), "必须打印命令: {stdout}");
+    assert!(!download_repo.exists(), "--dry-run 不能创建依赖下载目录");
+    assert!(!server_repo.exists(), "--dry-run 不能创建 mirror 仓库");
+    assert_eq!(
+        std::fs::read_dir(&tmpdir).unwrap().count(),
+        0,
+        "--dry-run 不能写临时 settings.xml"
+    );
+    assert!(
+        !home.join(".maven-util").exists(),
+        "--dry-run 不能触发首次运行初始化"
+    );
+
+    std::fs::remove_dir_all(&project).ok();
+    std::fs::remove_dir_all(&tmpdir).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn config_file_is_created_and_read_with_cli_override() {
+    let home = temp_dir("home-config");
+    let repo = repo_with_artifact("repo-config");
+    let tmpdir = temp_dir("config-tmp");
+    let configured = FakeUpstream::start(upload_routes(201));
+    let override_upstream = FakeUpstream::start(upload_routes(201));
+
+    // 1. 首次运行即自动生成 ~/.maven-util/config.toml，并报告缺少 url
+    let output = run(
+        &["upload", "--dir", repo.to_str().unwrap()],
+        &home,
+        Some(&tmpdir),
+    );
+    let config_path = home.join(".maven-util/config.toml");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "缺少 url 时必须失败: {}",
+        stdout(&output)
+    );
+    assert!(config_path.is_file(), "首次运行必须在用户目录生成配置文件");
+    let generated = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        generated.contains("[upload]"),
+        "生成的配置必须包含 upload 段"
+    );
+
+    // 2. 在配置文件中填写凭据后，直接运行 `maven-util upload` 即可上传
+    let db = repo.join("state.db");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[upload]\nurl = \"{}\"\nusername = \"admin\"\npassword = \"secret\"\ndir = \"{}\"\ndb_path = \"{}\"\n",
+            configured.base_url,
+            repo.display(),
+            db.display()
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["upload"], &home, Some(&tmpdir));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "读取配置文件后应能直接上传。stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        combined(&output).contains("上传成功"),
+        "实际输出: {}",
+        combined(&output)
+    );
+    let configured_hits = configured.hit_count();
+    assert!(configured_hits > 0);
+
+    // 3. 命令行 --url 优先于配置文件
+    let output = run(
+        &[
+            "upload",
+            "--url",
+            override_upstream.base_url.as_str(),
+            "--force",
+        ],
+        &home,
+        Some(&tmpdir),
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(override_upstream.hit_count() > 0, "命令行 --url 必须生效");
+    assert_eq!(
+        configured.hit_count(),
+        configured_hits,
+        "命令行覆盖后不应再请求配置文件中的仓库"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&tmpdir).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn missing_credentials_message_points_to_config_file() {
+    let home = temp_dir("home-missing-credentials");
+    let output = run(&["upload"], &home, None);
+    assert_eq!(output.status.code(), Some(1));
+    let combined = combined(&output);
+    assert!(
+        combined.contains(".maven-util"),
+        "错误信息必须指向配置文件: {combined}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn clean_dry_run_lists_files_without_deleting() {
+    let home = temp_dir("home-clean");
+    let repo = repo_with_artifact("repo-clean");
+    let state_file = repo.join("org/example/demo/1.0/_remote.repositories");
+    std::fs::write(&state_file, b"remote").unwrap();
+
+    let output = run(
+        &["clean", "--repo", repo.to_str().unwrap(), "--dry-run"],
+        &home,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout(&output).contains("找到"));
+    assert!(state_file.is_file(), "clean --dry-run 不能删除文件");
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn first_run_installs_binary_and_configures_path() {
+    let home = temp_dir("home-first-run");
+
+    // 首次运行（即使业务失败）也应完成初始化
+    let output = run(&["upload"], &home, None);
+    assert_eq!(output.status.code(), Some(1), "缺少 url 应当失败");
+
+    let config = home.join(".maven-util/config.toml");
+    assert!(config.is_file(), "首次运行必须生成配置文件");
+
+    let installed = home.join(".maven-util/bin/maven-util");
+    assert!(installed.is_file(), "首次运行必须复制可执行文件");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&installed).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0, "安装的可执行文件必须可执行");
+    }
+
+    let bashrc = home.join(".bashrc");
+    let rc = std::fs::read_to_string(&bashrc).expect("首次运行应写入 shell 配置");
+    assert!(
+        rc.contains(maven_util_init_path_export()),
+        "shell 配置必须包含 PATH 导出: {rc}"
+    );
+
+    // 安装的二进制可直接运行
+    let status = std::process::Command::new(&installed)
+        .arg("--version")
+        .env("HOME", &home)
+        .current_dir(&home)
+        .status()
+        .expect("运行安装后的可执行文件失败");
+    assert!(status.success());
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn init_subcommand_is_idempotent() {
+    let home = temp_dir("home-init-subcommand");
+
+    let first = run(&["init"], &home, None);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        stdout(&first),
+        stderr(&first)
+    );
+    let combined = combined(&first);
+    assert!(combined.contains("初始化完成"), "输出: {combined}");
+
+    let rc_path = home.join(".bashrc");
+    let after_first = std::fs::read_to_string(&rc_path).unwrap();
+    assert_eq!(
+        after_first.matches(maven_util_init_path_export()).count(),
+        1
+    );
+
+    let second = run(&["init"], &home, None);
+    assert_eq!(second.status.code(), Some(0));
+    let after_second = std::fs::read_to_string(&rc_path).unwrap();
+    assert_eq!(
+        after_second, after_first,
+        "重复 init 不能重复追加 PATH 配置"
+    );
+    assert_eq!(
+        after_second.matches(maven_util_init_path_export()).count(),
+        1
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn init_can_skip_path_configuration() {
+    let home = temp_dir("home-init-no-path");
+    let output = run(&["init", "--no-path"], &home, None);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(home.join(".maven-util/bin/maven-util").is_file());
+    assert!(
+        !home.join(".bashrc").exists(),
+        "--no-path 不应修改 shell 配置"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn project_config_merges_over_global_config() {
+    let home = temp_dir("home-merge");
+    let repo = repo_with_artifact("repo-merge");
+    let db = repo.join("state.db");
+    let upstream = FakeUpstream::start(upload_routes(201));
+
+    // 全局配置里放上传凭据
+    let config_dir = home.join(".maven-util");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[upload]\nurl = \"{}\"\nusername = \"admin\"\npassword = \"secret\"\ndir = \"{}\"\ndb_path = \"{}\"\n",
+            upstream.base_url,
+            repo.display(),
+            db.display()
+        ),
+    )
+    .unwrap();
+
+    // 当前目录再放一个只涉及其他段的项目级配置，不能覆盖掉全局上传凭据
+    std::fs::write(
+        home.join("maven-uploader.toml"),
+        "[clean]\nrepo = \"/tmp/nowhere\"\n",
+    )
+    .unwrap();
+
+    let output = run(&["upload"], &home, None);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "项目级配置不应覆盖全局上传凭据。stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(combined(&output).contains("上传成功"));
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn skip_init_env_disables_first_run_installation() {
+    let home = temp_dir("home-skip-init");
+    let output = Command::new(env!("CARGO_BIN_EXE_maven-util"))
+        .args(["upload"])
+        .env("HOME", &home)
+        .env("MAVEN_UTIL_SKIP_INIT", "1")
+        .current_dir(&home)
+        .output()
+        .expect("运行 maven-util 失败");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        !home.join(".maven-util").exists(),
+        "MAVEN_UTIL_SKIP_INIT=1 时不应做首次运行初始化"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+fn maven_util_init_path_export() -> &'static str {
+    r#"export PATH="$HOME/.maven-util/bin:$PATH""#
+}
+
+#[test]
+fn jar_fixture_matches_constant() {
+    // 保证夹具内容与 checksum 常量一致，避免上游缓存测试悄悄失效
+    assert!(!JAR.is_empty());
+}

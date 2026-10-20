@@ -1,5 +1,6 @@
-# maven-uploader 配置示例
-# 使用方式：
+# maven-util 项目级配置示例
+# 放在项目目录（文件名 maven-uploader.toml）时会逐字段覆盖
+# ~/.maven-util/config.toml；也可以显式指定：
 #   maven-util -c maven-uploader.toml download
 #   maven-util -c maven-uploader.toml serve
 #
