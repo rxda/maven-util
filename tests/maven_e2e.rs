@@ -84,27 +84,39 @@ fn download_builds_real_maven_project() {
     let download_repo = project.join("maven-repo");
     std::fs::write(project.join("pom.xml"), POM).expect("写入 pom.xml 失败");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_maven-util"))
-        .args([
-            "download",
-            project.to_str().unwrap(),
-            "--download-repo",
-            download_repo.to_str().unwrap(),
-            "--server-repo",
-            server_repo.to_str().unwrap(),
-            "--maven",
-            maven.to_str().unwrap(),
-            "--skip-tests",
-        ])
-        .env("HOME", &home)
-        .output()
-        .expect("运行 maven-util download 失败");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // 上游仓库偶发抖动时允许重试一次；mirror 仓库会复用已缓存的构件，
+    // 因此重试的代价很小。
+    let mut last_run: Option<(bool, String, String, usize)> = None;
+    for attempt in 1..=2 {
+        let output = Command::new(env!("CARGO_BIN_EXE_maven-util"))
+            .args([
+                "download",
+                project.to_str().unwrap(),
+                "--download-repo",
+                download_repo.to_str().unwrap(),
+                "--server-repo",
+                server_repo.to_str().unwrap(),
+                "--maven",
+                maven.to_str().unwrap(),
+                "--skip-tests",
+            ])
+            .env("HOME", &home)
+            .output()
+            .expect("运行 maven-util download 失败");
+        last_run = Some((
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            attempt,
+        ));
+        if last_run.as_ref().is_some_and(|run| run.0) {
+            break;
+        }
+    }
+    let (succeeded, stdout, stderr, attempts_used) = last_run.unwrap();
     assert!(
-        output.status.success(),
-        "Maven 构建必须成功。stdout={stdout}\nstderr={stderr}"
+        succeeded,
+        "Maven 构建必须成功（第 {attempts_used} 次尝试，最多 2 次）。\nstdout={stdout}\nstderr={stderr}"
     );
 
     let plugins = download_repo.join("org/apache/maven/plugins");
