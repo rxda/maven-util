@@ -34,7 +34,27 @@ jobs:
       # runner 预装了 Maven + Java，真实 Maven 端到端测试会执行；
       # 本地没有 Maven 时该测试自动跳过。
       - name: 运行全部测试
-        run: cargo test --locked
+        shell: bash
+        run: cargo test --locked 2>&1 | tee test-output.txt
+
+      # 把失败的关键行转成 annotation，便于在不下载日志的情况下定位问题。
+      - name: 提取失败详情
+        if: failure()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+          text = pathlib.Path("test-output.txt").read_text(errors="replace")
+          keys = [
+              line for line in text.splitlines()
+              if re.search(r"FAILED|panicked at|^error(\[|:)|assertion|left:|right:|^failures:", line)
+          ][:8]
+          if not keys:
+              keys = text.strip().splitlines()[-10:] or ["cargo test 无输出"]
+          for line in keys:
+              esc = line.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error title=cargo test::{esc}")
+          PY
 
   build:
     name: 构建 ${{ matrix.artifact }}
