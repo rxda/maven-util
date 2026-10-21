@@ -52,6 +52,10 @@ pub struct UploadConfig {
     pub retries: Option<u32>,
     /// 跳过 HEAD 远端存在性检查（状态库检查仍然生效）。
     pub skip_head_check: Option<bool>,
+    /// 上传路径："put"（默认，通用）或 "components"（Nexus 3，整构件一次提交）。
+    pub mode: Option<String>,
+    /// Components 模式下的仓库名；不填则从 url 的 `/repository/<名>` 推断。
+    pub repository: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -127,6 +131,8 @@ impl Config {
                 concurrency: over.concurrency.or(base.concurrency),
                 retries: over.retries.or(base.retries),
                 skip_head_check: over.skip_head_check.or(base.skip_head_check),
+                mode: over.mode.or(base.mode),
+                repository: over.repository.or(base.repository),
             }),
             serve: merge_section(self.serve, over.serve, |base, over| ServeConfig {
                 dir: over.dir.or(base.dir),

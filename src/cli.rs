@@ -91,6 +91,14 @@ pub struct UploadArgs {
     /// 跳过 HEAD 存在性检查（状态库仍生效；仅远端尚无内容时才更快）
     #[arg(long, env = "MAVEN_UTIL_SKIP_HEAD_CHECK")]
     pub skip_head_check: bool,
+
+    /// 上传路径：put（逐文件 HEAD+PUT，通用）或 components（Nexus 3，整构件一次提交）
+    #[arg(long, env = "MAVEN_UTIL_UPLOAD_MODE")]
+    pub mode: Option<String>,
+
+    /// Components 模式下的仓库名（不填则从 url 的 /repository/<名> 推断）
+    #[arg(long, env = "MAVEN_UTIL_REPOSITORY")]
+    pub repository: Option<String>,
 }
 
 /// `upload` 子命令：参数与不带子命令时的顶层上传参数一致。
@@ -197,6 +205,8 @@ impl UploadArgs {
             concurrency: sub.concurrency.or(top.concurrency),
             retries: sub.retries.or(top.retries),
             skip_head_check: sub.skip_head_check || top.skip_head_check,
+            mode: sub.mode.clone().or_else(|| top.mode.clone()),
+            repository: sub.repository.clone().or_else(|| top.repository.clone()),
         }
     }
 }
@@ -264,6 +274,13 @@ impl Args {
                 .unwrap_or_else(crate::upload::default_upload_concurrency),
             retries: cli.retries.or(file.retries).unwrap_or(2),
             skip_head_check: cli.skip_head_check || file.skip_head_check.unwrap_or(false),
+            mode: crate::upload::UploadMode::parse(
+                &cli.mode
+                    .clone()
+                    .or(file.mode)
+                    .unwrap_or_else(|| "put".to_string()),
+            )?,
+            repository: cli.repository.clone().or(file.repository),
         })
     }
 

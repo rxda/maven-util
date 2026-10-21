@@ -17,7 +17,36 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
+use crate::components_api::{self, ComponentsTarget};
 use crate::tls::HttpSettings;
+
+/// 上传路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UploadMode {
+    /// 逐文件 HEAD + PUT：通用，任何支持 Maven 布局的仓库都能用。
+    #[default]
+    Put,
+    /// Nexus 3 Components API：整个构件一次 multipart 提交，
+    /// 请求数从「文件数 × 2」降到「构件数」，校验和由服务端计算。
+    Components,
+}
+
+impl UploadMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "put" | "" => Ok(Self::Put),
+            "components" | "component" | "nexus" => Ok(Self::Components),
+            other => Err(anyhow!("未知的上传模式: {other}（可选 put / components）")),
+        }
+    }
+}
+
+/// Components 模式下解析好的目标仓库。
+#[derive(Debug, Clone)]
+struct ComponentsMode {
+    release: ComponentsTarget,
+    snapshot: Option<ComponentsTarget>,
+}
 
 /// 上传状态表：Key 是目标 URL，Value 是文件指纹（`大小:纳秒mtime`）。
 ///
@@ -50,6 +79,10 @@ pub struct UploadOptions {
     pub retries: u32,
     /// 跳过 HEAD 远端存在性检查（状态库检查仍然生效）。
     pub skip_head_check: bool,
+    /// 上传路径：逐文件 PUT 或 Nexus Components API。
+    pub mode: UploadMode,
+    /// Components 模式下显式指定仓库名（不填则从 URL 的 `/repository/<名>` 推断）。
+    pub repository: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +169,23 @@ pub fn fingerprint(path: &Path) -> Result<String> {
 }
 
 pub fn run_upload(options: UploadOptions, http: &HttpSettings) -> Result<()> {
+    // Components 模式需要先解析出「服务根地址 + 仓库名」，解析失败要在
+    // 任何副作用（建目录、开数据库）之前报错。
+    let components = match options.mode {
+        UploadMode::Put => None,
+        UploadMode::Components => Some(ComponentsMode {
+            release: resolve_target(&options.url, options.repository.as_deref(), "url")?,
+            snapshot: match &options.snapshot_url {
+                Some(url) => Some(resolve_target(
+                    url,
+                    options.repository.as_deref(),
+                    "snapshot-url",
+                )?),
+                None => None,
+            },
+        }),
+    };
+
     let root_path = fs::canonicalize(&options.dir)
         .with_context(|| format!("路径无效: {}", options.dir.display()))?;
 
@@ -228,6 +278,7 @@ pub fn run_upload(options: UploadOptions, http: &HttpSettings) -> Result<()> {
     let uploader = Arc::new(Uploader {
         client: Arc::new(http.upload_client(worker_count)?),
         options: Arc::new(options),
+        components,
         pb: upload_pb.clone(),
         db,
         db_tx,
@@ -302,9 +353,27 @@ pub fn run_upload(options: UploadOptions, http: &HttpSettings) -> Result<()> {
 struct Uploader {
     client: Arc<Client>,
     options: Arc<UploadOptions>,
+    /// Components 模式下已解析的目标仓库；PUT 模式为 None。
+    components: Option<ComponentsMode>,
     pb: ProgressBar,
     db: Arc<Database>,
     db_tx: Sender<(String, String)>,
+}
+
+/// 把仓库 URL 解析成 Components API 需要的「服务根地址 + 仓库名」。
+///
+/// 配置了 `repository` 时直接用它作为仓库名、URL 作为服务根；
+/// 否则从 URL 的 `/repository/<名>` 段推断。
+fn resolve_target(url: &str, repository: Option<&str>, field: &str) -> Result<ComponentsTarget> {
+    match repository {
+        Some(name) => ComponentsTarget::from_base_and_repository(url, name)
+            .with_context(|| format!("无法解析 {field} 作为服务根地址: {url}")),
+        None => ComponentsTarget::from_repository_url(url).with_context(|| {
+            format!(
+                "无法从 {field} 推断仓库名（需要形如 https://host/repository/<仓库名>）: {url}。                 可改用 `repository` 配置显式指定仓库名，或改回 put 模式"
+            )
+        }),
+    }
 }
 
 impl Uploader {
@@ -333,6 +402,17 @@ impl Uploader {
         self.pb
             .set_message(format!("{}:{}", artifact.artifact_id, artifact.version));
 
+        if let Some(mode) = &self.components {
+            let target = if artifact.version.ends_with("-SNAPSHOT") {
+                mode.snapshot.as_ref().unwrap_or(&mode.release)
+            } else {
+                &mode.release
+            };
+            self.upload_component(artifact, target, failures, uploaded, already_exists);
+            self.pb.inc(1);
+            return;
+        }
+
         for (file_path, remote_ext) in &artifact.files {
             match self.upload_file(&base_url, artifact, file_path, remote_ext) {
                 Ok(FileOutcome::Uploaded) => {
@@ -351,6 +431,107 @@ impl Uploader {
             }
         }
         self.pb.inc(1);
+    }
+
+    /// Components 模式：整个构件一次 multipart 提交。
+    ///
+    /// 与 PUT 模式的差异：
+    /// - 状态库按**组件**记录指纹（任一资产变化都要整组件重传）；
+    /// - 存在性检查用一次查询代替逐文件 HEAD；
+    /// - 校验和文件不上传，由服务端计算。
+    fn upload_component(
+        &self,
+        artifact: &MavenArtifact,
+        target: &ComponentsTarget,
+        failures: &FailureLog,
+        uploaded: &AtomicUsize,
+        already_exists: &AtomicUsize,
+    ) {
+        let label = format!(
+            "{}:{}:{}",
+            artifact.group_id, artifact.artifact_id, artifact.version
+        );
+        let assets = components_api::collect_assets(artifact);
+        if assets.is_empty() {
+            emit(&self.pb, format!("  [!] 跳过 {label}：没有可提交的资产"));
+            return;
+        }
+        let key = components_api::component_key(target, artifact);
+        let fingerprint = match components_api::component_fingerprint(&assets) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                emit(&self.pb, format!("  [❌] 失败: {label} - {error:#}"));
+                failures.record(format!("{label}: {error:#}"));
+                return;
+            }
+        };
+
+        if !self.options.force {
+            if let Some(stored) = self.stored_fingerprint(&key).unwrap_or(None)
+                && stored == fingerprint
+            {
+                emit(&self.pb, format!("  [-] 状态库已存在: {label}"));
+                already_exists.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            // 查询远端是否已有同坐标组件；查询失败不判定成败，继续提交。
+            if !self.options.skip_head_check {
+                match components_api::component_exists(
+                    &self.client,
+                    target,
+                    artifact,
+                    &self.options.username,
+                    &self.options.password,
+                ) {
+                    Ok(true) => {
+                        let _ = self.record(&key, &fingerprint);
+                        emit(&self.pb, format!("  [-] 远端已存在: {label}"));
+                        already_exists.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        emit(&self.pb, format!("  [!] 查询组件失败，继续提交: {error:#}"));
+                    }
+                }
+            }
+        }
+
+        // multipart 表单每次重试都要重建（内部持有文件句柄）
+        let response = self.send_with_retry("Components 提交", || {
+            let form = components_api::build_form(artifact, &assets)?;
+            Ok(self
+                .client
+                .post(target.components_url())
+                .query(&[("repository", target.repository.as_str())])
+                .basic_auth(&self.options.username, Some(&self.options.password))
+                .multipart(form))
+        });
+
+        match response {
+            Ok(response) if response.status().is_success() => {
+                let _ = self.record(&key, &fingerprint);
+                uploaded.fetch_add(assets.len(), Ordering::Relaxed);
+                emit(
+                    &self.pb,
+                    format!(
+                        "  [+] 提交成功: {label}（{} 个资产，1 次请求）",
+                        assets.len()
+                    ),
+                );
+            }
+            Ok(response) => {
+                let status = response.status();
+                let detail = response.text().unwrap_or_default();
+                let message = format!("HTTP {status}: {}", truncate(&detail));
+                emit(&self.pb, format!("  [❌] 失败: {label} - {message}"));
+                failures.record(format!("{label}: {message}"));
+            }
+            Err(error) => {
+                emit(&self.pb, format!("  [❌] 失败: {label} - {error:#}"));
+                failures.record(format!("{label}: {error:#}"));
+            }
+        }
     }
 
     fn upload_file(

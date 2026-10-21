@@ -5,6 +5,7 @@
 //! - [`config`]：`~/.maven-util/config.toml` 的生成与读取
 //! - [`init`]：首次运行自装到 `~/.maven-util/bin` 并配置 PATH
 //! - [`upload`]：本地仓库批量上传
+//! - [`components_api`]：Nexus 3 Components API（`mode = "components"`，整构件一次提交）
 //! - [`downloader`]：内置 mirror 执行 Maven 构建并缓存依赖
 //! - [`server`]：只读 Maven 仓库 HTTP 服务
 //! - [`tls`]：HTTP 客户端与超时
@@ -13,6 +14,7 @@
 pub mod checksum;
 pub mod cleanup;
 pub mod cli;
+pub mod components_api;
 pub mod config;
 pub mod downloader;
 pub mod init;

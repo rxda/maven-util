@@ -72,6 +72,11 @@ retries = 2
 # 跳过 HEAD 远端存在性检查（状态库仍然生效）。仅当远端尚无这些文件时才能减半请求；
 # 远端已有内容时会改为全量 PUT 重传，且本地改动的构件将被覆盖上传
 skip_head_check = false
+# 上传路径："put"（默认，逐文件 HEAD+PUT，任何 Maven 布局仓库可用）
+# 或 "components"（Nexus 3 Components API：整个构件一次 multipart 提交）
+mode = "put"
+# components 模式下显式指定仓库名（不填则从 url 的 /repository/<名> 推断）
+# repository = "maven-releases"
 
 [download]
 workdir = "."
@@ -140,6 +145,8 @@ maven-util \
     --concurrency <N>        上传并发数，默认 = CPU 核数（同时进行的 HTTP 请求数）
     --retries <N>            网络错误 / 5xx / 429 的重试次数，默认 2
     --skip-head-check        跳过 HEAD 远端存在性检查（状态库仍然生效）
+    --mode <MODE>            上传路径：put（默认）或 components（Nexus 3）
+    --repository <NAME>      components 模式下的仓库名（不填则从 url 推断）
 -E, --exclude <TEXT,...>    排除 groupId 或 artifactId 关键词
     --max-size <MB>         跳过超过大小的 jar/war，默认 100MB
     --db-path <FILE>        上传状态数据库，默认 ~/.maven-util/uploads.db
@@ -179,6 +186,43 @@ maven-util \
 - 阻塞线程的内存开销很小，几十个并发线程不会造成负担；只有需要 500+
   并发或同时跑大量 TLS 长连接时，才值得改成异步（tokio + reqwest async，
   代价是引入运行时并重写上传路径）。
+
+### Components 模式（Nexus 3）
+
+PUT 模式对每个文件各发一次请求（HEAD + PUT），而 Nexus 3 的 Components API
+允许**一个请求提交整个构件**：jar + pom + sources + javadoc 一起发，校验和由
+服务端计算。请求数从「文件数 × 2」降到「构件数」。
+
+```text
+maven-util upload --mode components -U https://nexus.example.com/repository/maven-releases ...
+```
+
+请求端点是 `POST {服务根}/service/rest/v1/components?repository=<仓库名>`，
+因此 URL 必须形如 `https://host/repository/<仓库名>`，工具才能拆出「服务根 +
+仓库名」。如果你的部署不遵循这个路径结构，用 `--repository`（或配置里的
+`repository`）显式指定仓库名，URL 就按服务根地址填。
+
+与 PUT 模式的差异：
+
+| | put（默认） | components |
+| --- | --- | --- |
+| 请求数 | 文件数 × 2 | 构件数 |
+| 适用范围 | 任何 Maven 布局仓库 | 仅 Nexus 3 |
+| 校验和 | 本地算并上传 `.sha1`/`.md5` | 服务端计算，本地校验和文件不上传 |
+| 存在性检查 | 逐文件 HEAD | 按坐标查询一次组件 |
+| 失败粒度 | 单文件 | 整个构件（重传时全部资产一起重传） |
+| classifier | 隐含在文件名 | 显式 `maven2.assetN.classifier` 字段 |
+| 状态库指纹 | 按文件 | 按组件（任一资产变化 → 整组件重传） |
+
+注意：
+
+- **不使用 `maven2.generate-pom`**。它生成的 POM 只有坐标、没有依赖信息，
+  下游消费时会以 `NoClassDefFoundError` 的形式静默失败。本工具始终上传真实
+  POM；即便某个构件确实没有 POM，也只影响它自己，不会污染下游。
+- 校验和文件（`.sha1`/`.md5`/`.sha256`/`.sha512`）不会出现在请求体里，
+  服务端会自己算。这与 PUT 模式不同——PUT 模式必须把它们一起传上去。
+- 失败重试是整构件级别的（`--retries` 同样生效），单个资产失败会导致整个
+  构件下次重传。
 
 ## 下载依赖
 

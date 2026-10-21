@@ -21,6 +21,8 @@ pub enum Reply {
     Status(u16),
     /// HEAD 与其他方法返回不同状态码（用于上传测试：远端不存在但 PUT 成功）
     MethodStatus { head: u16, other: u16 },
+    /// 指定状态码 + JSON 响应体（用于 Components API 的存在性查询）
+    Json(u16, String),
     /// PUT 前 N 次返回失败状态码、之后成功（用于重试测试）；HEAD 恒为 404。
     FlakyPut {
         counter: Arc<AtomicUsize>,
@@ -131,7 +133,30 @@ fn handle(
             Err(_) => break,
         }
     }
-    let text = String::from_utf8_lossy(&raw).into_owned();
+    let mut text = String::from_utf8_lossy(&raw).into_owned();
+
+    // 读取请求体：multipart 提交需要完整读完，否则客户端可能写到一半被重置
+    let content_length = text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    let mut body = vec![0_u8; content_length];
+    if content_length > 0 {
+        let mut read = 0;
+        while read < content_length {
+            match stream.read(&mut body[read..]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => read += n,
+            }
+        }
+        body.truncate(read);
+    }
+    text.push_str(&String::from_utf8_lossy(&body));
     requests.lock().unwrap().push(text.clone());
     hits.fetch_add(1, Ordering::Relaxed);
 
@@ -145,7 +170,10 @@ fn handle(
         .unwrap_or_default()
         .to_string();
 
-    let response: Vec<u8> = match routes.get(&path) {
+    // 路由支持两种键：`METHOD /path`（按方法区分）与 `/path`（所有方法共用）
+    let method_key = format!("{method} {path}");
+    let lookup = routes.get(&method_key).or_else(|| routes.get(&path));
+    let response: Vec<u8> = match lookup {
         Some(Reply::Artifact(body)) => reply(200, "OK", body, &method),
         Some(Reply::Delayed(body, delay)) => {
             thread::sleep(*delay);
@@ -183,6 +211,10 @@ fn handle(
                 };
                 reply(code, reason, b"", &method)
             }
+        }
+        Some(Reply::Json(code, body)) => {
+            let reason = if *code == 200 { "OK" } else { "Status" };
+            reply(*code, reason, body.as_bytes(), &method)
         }
         Some(Reply::Status(code)) => {
             let reason = match code {
@@ -271,6 +303,23 @@ pub fn maven_repo_fixture(root: &Path) -> PathBuf {
 
 pub const POM: &[u8] = br#"<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId><artifactId>demo</artifactId><version>1.0</version></project>"#;
 pub const JAR: &[u8] = b"jar-bytes-not-a-real-jar";
+pub const SOURCES_JAR: &[u8] = b"sources-jar-bytes";
+pub const JAR_SHA1: &[u8] = b"0123456789abcdef0123456789abcdef01234567";
+
+/// 更丰富的夹具：在 pom + jar 基础上补 sources jar 与本地校验和文件，
+/// 用于验证 Components 模式的 classifier 解析与「校验和不上传」。
+pub fn maven_repo_fixture_with_extras(root: &Path) -> PathBuf {
+    let artifact_dir = maven_repo_fixture(root);
+    std::fs::write(artifact_dir.join("demo-1.0-sources.jar"), SOURCES_JAR)
+        .expect("写入 sources jar 失败");
+    std::fs::write(artifact_dir.join("demo-1.0.jar.sha1"), JAR_SHA1).expect("写入 sha1 失败");
+    std::fs::write(
+        artifact_dir.join("demo-1.0.pom.md5"),
+        b"0123456789abcdef0123456789abcdef",
+    )
+    .expect("写入 md5 失败");
+    artifact_dir
+}
 
 /// 检查目录下是否存在指定后缀的 `.part` 临时缓存文件。
 pub fn has_partial_files(root: &Path) -> bool {

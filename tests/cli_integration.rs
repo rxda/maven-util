@@ -4,7 +4,9 @@
 
 mod common;
 
-use common::{FakeUpstream, JAR, Reply, maven_repo_fixture, temp_dir};
+use common::{
+    FakeUpstream, JAR, Reply, maven_repo_fixture, maven_repo_fixture_with_extras, temp_dir,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -74,6 +76,13 @@ fn upload_routes(status: u16) -> HashMap<String, Reply> {
 fn repo_with_artifact(name: &str) -> PathBuf {
     let root = temp_dir(name);
     maven_repo_fixture(&root);
+    root
+}
+
+/// 含 sources jar 与本地校验和文件的仓库（验证 classifier 与「校验和不上传」）。
+fn repo_with_extras(name: &str) -> PathBuf {
+    let root = temp_dir(name);
+    maven_repo_fixture_with_extras(&root);
     root
 }
 
@@ -739,4 +748,293 @@ fn skip_head_check_uploads_even_when_remote_exists() {
     std::fs::remove_dir_all(&repo).ok();
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&second_home).ok();
+}
+
+/// Components 模式的路由：查询接口按方法区分（GET 查存在性、POST 提交）。
+fn components_routes(query_items: &str, post_status: u16) -> HashMap<String, Reply> {
+    let mut routes = HashMap::new();
+    routes.insert(
+        "GET /service/rest/v1/components".to_string(),
+        Reply::Json(200, format!("{{\"items\":{query_items}}}")),
+    );
+    routes.insert(
+        "POST /service/rest/v1/components".to_string(),
+        Reply::Status(post_status),
+    );
+    routes
+}
+
+/// Components 模式：整个构件一次 multipart 提交，请求数与文件数无关。
+#[test]
+fn components_mode_submits_single_multipart_request() {
+    let home = temp_dir("home-components");
+    let repo = repo_with_artifact("repo-components");
+    // 远端查询返回空（组件不存在）→ 应提交；提交返回 204
+    let upstream = FakeUpstream::start(components_routes("[]", 204));
+    let url = format!("{}/repository/maven-releases", upstream.base_url);
+
+    let output = run(
+        &[
+            "upload",
+            "--url",
+            &url,
+            "--username",
+            "admin",
+            "--password",
+            "secret",
+            "--dir",
+            repo.to_str().unwrap(),
+            "--db-path",
+            repo.join("state.db").to_str().unwrap(),
+            "--mode",
+            "components",
+        ],
+        &home,
+        None,
+    );
+
+    assert!(output.status.success(), "{}", combined(&output));
+    assert!(
+        combined(&output).contains("提交成功"),
+        "应报告组件提交成功：{}",
+        combined(&output)
+    );
+
+    let requests = upstream.requests();
+    let posts: Vec<_> = requests
+        .iter()
+        .filter(|request| request.starts_with("POST /service/rest/v1/components"))
+        .collect();
+    assert_eq!(posts.len(), 1, "整个构件只应提交一次：{requests:?}");
+    let body = &posts[0];
+    for expected in [
+        "maven2.groupId",
+        "org.example",
+        "maven2.artifactId",
+        "demo",
+        "maven2.version",
+        "1.0",
+        "maven2.generate-pom",
+        "maven2.asset1.extension",
+        "pom",
+        "maven2.asset2.extension",
+        "jar",
+        "filename=\"demo-1.0.pom\"",
+        "filename=\"demo-1.0.jar\"",
+    ] {
+        assert!(
+            body.contains(expected),
+            "multipart 请求体缺少 {expected:?}：{body}"
+        );
+    }
+    assert!(
+        !body.contains(".sha1") && !body.contains(".md5"),
+        "校验和文件不应上传（服务端自算）：{body}"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Components 模式：classifier 正确下发，校验和文件不进请求体。
+#[test]
+fn components_mode_sends_classifier_and_skips_checksums() {
+    let home = temp_dir("home-components-cl");
+    let repo = repo_with_extras("repo-components-cl");
+    let upstream = FakeUpstream::start(components_routes("[]", 204));
+    let url = format!("{}/repository/maven-releases", upstream.base_url);
+
+    let output = run(
+        &[
+            "upload",
+            "--url",
+            &url,
+            "--username",
+            "admin",
+            "--password",
+            "secret",
+            "--dir",
+            repo.to_str().unwrap(),
+            "--db-path",
+            repo.join("state.db").to_str().unwrap(),
+            "--mode",
+            "components",
+        ],
+        &home,
+        None,
+    );
+    assert!(output.status.success(), "{}", combined(&output));
+
+    let requests = upstream.requests();
+    let body = requests
+        .iter()
+        .find(|request| request.starts_with("POST /service/rest/v1/components"))
+        .expect("应有组件提交请求");
+
+    // 资产按文件名路径排序，sources jar 排在最前（`-` < `.`）
+    assert!(
+        body.contains("maven2.asset1.classifier\"\r\n\r\nsources\r\n"),
+        "sources jar 应带 classifier=sources：{body}"
+    );
+    assert!(
+        body.contains("filename=\"demo-1.0-sources.jar\""),
+        "sources jar 文件名应出现在请求体：{body}"
+    );
+    assert!(
+        !body.contains(".sha1") && !body.contains(".md5"),
+        "本地校验和文件不应上传（服务端自算）：{body}"
+    );
+    // 三个资产：sources jar、jar、pom
+    for expected in ["maven2.asset1", "maven2.asset2", "maven2.asset3"] {
+        assert!(body.contains(expected), "缺少 {expected}：{body}");
+    }
+    assert!(!body.contains("maven2.asset4"), "不应有第四个资产：{body}");
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Components 模式：远端已有同坐标组件时跳过，不重复提交。
+#[test]
+fn components_mode_skips_existing_component() {
+    let home = temp_dir("home-components-exists");
+    let repo = repo_with_artifact("repo-components-exists");
+    let upstream = FakeUpstream::start(components_routes(
+        "[{\"id\":\"abc\",\"group\":\"org.example\",\"name\":\"demo\",\"version\":\"1.0\"}]",
+        204,
+    ));
+    let url = format!("{}/repository/maven-releases", upstream.base_url);
+
+    let output = run(
+        &[
+            "upload",
+            "--url",
+            &url,
+            "--username",
+            "admin",
+            "--password",
+            "secret",
+            "--dir",
+            repo.to_str().unwrap(),
+            "--db-path",
+            repo.join("state.db").to_str().unwrap(),
+            "--mode",
+            "components",
+        ],
+        &home,
+        None,
+    );
+
+    assert!(output.status.success(), "{}", combined(&output));
+    assert!(
+        combined(&output).contains("远端已存在"),
+        "应报告远端已存在并跳过：{}",
+        combined(&output)
+    );
+    assert!(
+        !upstream
+            .requests()
+            .iter()
+            .any(|request| request.starts_with("POST")),
+        "已存在的组件不应再次提交：{:?}",
+        upstream.requests()
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Components 模式：提交返回 5xx 时按重试次数退避，耗尽后以非零退出。
+#[test]
+fn components_mode_retries_then_fails() {
+    let home = temp_dir("home-components-retry");
+    let repo = repo_with_artifact("repo-components-retry");
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut routes = components_routes("[]", 204);
+    routes.insert(
+        "POST /service/rest/v1/components".to_string(),
+        Reply::FlakyPut {
+            counter: std::sync::Arc::clone(&counter),
+            fail_times: usize::MAX,
+            fail_code: 503,
+            then_code: 204,
+        },
+    );
+    let upstream = FakeUpstream::start(routes);
+    let url = format!("{}/repository/maven-releases", upstream.base_url);
+
+    let output = run(
+        &[
+            "upload",
+            "--url",
+            &url,
+            "--username",
+            "admin",
+            "--password",
+            "secret",
+            "--dir",
+            repo.to_str().unwrap(),
+            "--db-path",
+            repo.join("state.db").to_str().unwrap(),
+            "--mode",
+            "components",
+            "--retries",
+            "2",
+        ],
+        &home,
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "重试耗尽必须退出 1：{}",
+        combined(&output)
+    );
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "首次 + 2 次重试，共 3 次提交"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Components 模式：URL 中没有 /repository/<名> 时给出可操作的报错。
+#[test]
+fn components_mode_rejects_url_without_repository_segment() {
+    let home = temp_dir("home-components-badurl");
+    let repo = repo_with_artifact("repo-components-badurl");
+    let upstream = FakeUpstream::start(components_routes("[]", 204));
+
+    let output = run(
+        &[
+            "upload",
+            "--url",
+            &upstream.base_url,
+            "--username",
+            "admin",
+            "--password",
+            "secret",
+            "--dir",
+            repo.to_str().unwrap(),
+            "--db-path",
+            repo.join("state.db").to_str().unwrap(),
+            "--mode",
+            "components",
+        ],
+        &home,
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    let message = combined(&output);
+    assert!(
+        message.contains("/repository/") && message.contains("repository"),
+        "报错应指出如何修复 URL：{message}"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
 }
