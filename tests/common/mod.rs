@@ -21,6 +21,13 @@ pub enum Reply {
     Status(u16),
     /// HEAD 与其他方法返回不同状态码（用于上传测试：远端不存在但 PUT 成功）
     MethodStatus { head: u16, other: u16 },
+    /// PUT 前 N 次返回失败状态码、之后成功（用于重试测试）；HEAD 恒为 404。
+    FlakyPut {
+        counter: Arc<AtomicUsize>,
+        fail_times: usize,
+        fail_code: u16,
+        then_code: u16,
+    },
 }
 
 /// 一个最小可用的 HTTP 服务器，用于充当 Maven 上游或被上传的目标仓库。
@@ -153,6 +160,29 @@ fn handle(
                 _ => "Status",
             };
             reply(code, reason, b"", &method)
+        }
+        Some(Reply::FlakyPut {
+            counter,
+            fail_times,
+            fail_code,
+            then_code,
+        }) => {
+            if method == "HEAD" {
+                reply(404, "Not Found", b"", &method)
+            } else {
+                let nth = counter.fetch_add(1, Ordering::Relaxed);
+                let code = if nth < *fail_times {
+                    *fail_code
+                } else {
+                    *then_code
+                };
+                let reason = match code {
+                    200 | 201 => "Created",
+                    503 => "Service Unavailable",
+                    _ => "Status",
+                };
+                reply(code, reason, b"", &method)
+            }
         }
         Some(Reply::Status(code)) => {
             let reason = match code {

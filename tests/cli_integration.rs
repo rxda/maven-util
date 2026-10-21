@@ -32,6 +32,9 @@ fn run(args: &[&str], home: &Path, tmpdir: Option<&Path>) -> Output {
         "NEXUS_EXCLUDE",
         "NEXUS_MAX_MB",
         "MAVEN_UTIL_DB_PATH",
+        "MAVEN_UTIL_CONCURRENCY",
+        "MAVEN_UTIL_RETRIES",
+        "MAVEN_UTIL_SKIP_HEAD_CHECK",
     ] {
         command.env_remove(variable);
     }
@@ -530,4 +533,210 @@ fn maven_util_init_path_export() -> &'static str {
 fn jar_fixture_matches_constant() {
     // 保证夹具内容与 checksum 常量一致，避免上游缓存测试悄悄失效
     assert!(!JAR.is_empty());
+}
+
+/// 瞬时 5xx 会被自动重试；重试成功后整体仍算成功。
+#[test]
+fn upload_retries_transient_5xx_until_success() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let home = temp_dir("home-retry");
+    let repo = repo_with_artifact("repo-retry");
+    let jar_hits = Arc::new(AtomicUsize::new(0));
+    let pom_hits = Arc::new(AtomicUsize::new(0));
+    let mut routes = HashMap::new();
+    for (path, hits) in [
+        ("/org/example/demo/1.0/demo-1.0.jar", &jar_hits),
+        ("/org/example/demo/1.0/demo-1.0.pom", &pom_hits),
+    ] {
+        routes.insert(
+            path.to_string(),
+            Reply::FlakyPut {
+                counter: Arc::clone(hits),
+                fail_times: 2,
+                fail_code: 503,
+                then_code: 201,
+            },
+        );
+    }
+    let upstream = FakeUpstream::start(routes);
+
+    let output = run(
+        &[
+            "upload",
+            "--url",
+            &upstream.base_url,
+            "--username",
+            "u",
+            "--password",
+            "p",
+            "--dir",
+            repo.to_str().unwrap(),
+            "--db-path",
+            home.join("state.db").to_str().unwrap(),
+            "--retries",
+            "3",
+            "--concurrency",
+            "2",
+        ],
+        &home,
+        None,
+    );
+
+    assert!(
+        output.status.success(),
+        "重试成功后必须退出 0：{}",
+        combined(&output)
+    );
+    assert_eq!(
+        jar_hits.load(Ordering::Relaxed),
+        3,
+        "jar：2 次 503 + 1 次成功"
+    );
+    assert_eq!(
+        pom_hits.load(Ordering::Relaxed),
+        3,
+        "pom：2 次 503 + 1 次成功"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// 重试次数耗尽后必须以非零退出码结束，而不是假装成功。
+#[test]
+fn upload_fails_when_retries_exhausted() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let home = temp_dir("home-retry-exhausted");
+    let repo = repo_with_artifact("repo-retry-exhausted");
+    let jar_hits = Arc::new(AtomicUsize::new(0));
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/org/example/demo/1.0/demo-1.0.jar".to_string(),
+        Reply::FlakyPut {
+            counter: Arc::clone(&jar_hits),
+            fail_times: usize::MAX,
+            fail_code: 503,
+            then_code: 201,
+        },
+    );
+    routes.insert(
+        "/org/example/demo/1.0/demo-1.0.pom".to_string(),
+        Reply::Status(503),
+    );
+    let upstream = FakeUpstream::start(routes);
+
+    let output = run(
+        &[
+            "upload",
+            "--url",
+            &upstream.base_url,
+            "--username",
+            "u",
+            "--password",
+            "p",
+            "--dir",
+            repo.to_str().unwrap(),
+            "--db-path",
+            home.join("state.db").to_str().unwrap(),
+            "--retries",
+            "1",
+            "--concurrency",
+            "1",
+        ],
+        &home,
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "重试耗尽必须退出 1：{}",
+        combined(&output)
+    );
+    assert!(
+        combined(&output).contains("上传失败"),
+        "必须报告上传失败：{}",
+        combined(&output)
+    );
+    assert_eq!(
+        jar_hits.load(Ordering::Relaxed),
+        2,
+        "首次请求 + 1 次重试，共 2 次"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// `--skip-head-check` 跳过 HEAD 存在性检查（状态库仍然生效），直接 PUT。
+#[test]
+fn skip_head_check_uploads_even_when_remote_exists() {
+    let home = temp_dir("home-skip-head");
+    let second_home = temp_dir("home-skip-head-2");
+    let repo = repo_with_artifact("repo-skip-head");
+    let mut routes = HashMap::new();
+    for path in [
+        "/org/example/demo/1.0/demo-1.0.pom",
+        "/org/example/demo/1.0/demo-1.0.jar",
+    ] {
+        routes.insert(
+            path.to_string(),
+            Reply::MethodStatus {
+                head: 200,
+                other: 201,
+            },
+        );
+    }
+    let upstream = FakeUpstream::start(routes);
+    let base: &[&str] = &[
+        "upload",
+        "--url",
+        &upstream.base_url,
+        "--username",
+        "u",
+        "--password",
+        "p",
+        "--dir",
+        repo.to_str().unwrap(),
+    ];
+
+    // 默认行为：HEAD 200 → 全部按已存在跳过，不发 PUT
+    let first = run(base, &home, None);
+    assert!(first.status.success(), "{}", combined(&first));
+    assert!(
+        upstream
+            .requests()
+            .iter()
+            .all(|request| !request.starts_with("PUT")),
+        "默认应跳过远端已存在的文件：{:?}",
+        upstream.requests()
+    );
+
+    // 显式跳过 HEAD 检查：直接 PUT
+    let second_db = second_home.join("state.db");
+    let mut args: Vec<&str> = base.to_vec();
+    args.extend_from_slice(&[
+        "--db-path",
+        second_db.to_str().unwrap(),
+        "--skip-head-check",
+    ]);
+    let second = run(&args, &second_home, None);
+    assert!(second.status.success(), "{}", combined(&second));
+    assert_eq!(
+        upstream
+            .requests()
+            .iter()
+            .filter(|request| request.starts_with("PUT"))
+            .count(),
+        2,
+        "--skip-head-check 后两个文件都必须真正 PUT"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&second_home).ok();
 }

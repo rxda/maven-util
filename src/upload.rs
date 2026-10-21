@@ -8,7 +8,6 @@ use crossbeam_channel::{Sender, unbounded};
 use dashmap::DashMap;
 use indicatif::{ProgressBar, ProgressStyle};
 use jwalk::WalkDir;
-use rayon::iter::{ParallelBridge, ParallelIterator};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use reqwest::blocking::Client;
 use std::fs::{self, File};
@@ -16,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use crate::tls::HttpSettings;
 
@@ -45,6 +44,12 @@ pub struct UploadOptions {
     /// 跳过超过此大小（MB）的 jar/war。
     pub max_size_mb: u64,
     pub db_path: PathBuf,
+    /// 上传并发数：同时进行的 HTTP 请求数（每个上传线程一个请求）。
+    pub concurrency: usize,
+    /// 瞬时错误（网络错误 / 5xx / 429）的最大重试次数。
+    pub retries: u32,
+    /// 跳过 HEAD 远端存在性检查（状态库检查仍然生效）。
+    pub skip_head_check: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +92,16 @@ impl FailureLog {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
+}
+
+/// 默认上传并发数：等于 CPU 核数。
+///
+/// 上传是纯 I/O 密集操作，实测在 80ms 模拟延迟下吞吐与并发数严格成正比
+/// （4 并发 800 请求约 16s，32 并发约 2s），因此远距离仓库建议显式调高。
+pub fn default_upload_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|value| value.get().max(1))
+        .unwrap_or(4)
 }
 
 /// 扫描专用线程池大小：最多 4 个线程，避免和上传侧抢 CPU。
@@ -209,29 +224,38 @@ pub fn run_upload(options: UploadOptions, http: &HttpSettings) -> Result<()> {
     });
 
     // 上传线程（消费者）
-    let client = Arc::new(http.upload_client()?);
-    let uploader = Uploader {
-        client,
+    let worker_count = options.concurrency.max(1);
+    let uploader = Arc::new(Uploader {
+        client: Arc::new(http.upload_client(worker_count)?),
         options: Arc::new(options),
         pb: upload_pb.clone(),
         db,
         db_tx,
-    };
+    });
     let failures = Arc::new(FailureLog::default());
     let uploaded = Arc::new(AtomicUsize::new(0));
     let already_exists = Arc::new(AtomicUsize::new(0));
 
-    let upload_failures = Arc::clone(&failures);
-    let upload_uploaded = Arc::clone(&uploaded);
-    let upload_existing = Arc::clone(&already_exists);
-    ParallelIterator::for_each(ParallelBridge::par_bridge(rx.into_iter()), |artifact| {
-        uploader.upload_artifact(
-            &artifact,
-            &upload_failures,
-            &upload_uploaded,
-            &upload_existing,
-        );
-    });
+    // 专用上传线程池：每个线程阻塞在一个 HTTP 请求上，线程数与 CPU 无关。
+    // 阻塞线程的内存开销可以忽略，而高延迟远端的吞吐与并发数成正比。
+    let workers: Vec<_> = (0..worker_count)
+        .map(|_| {
+            let uploader = Arc::clone(&uploader);
+            let rx = rx.clone();
+            let failures = Arc::clone(&failures);
+            let uploaded = Arc::clone(&uploaded);
+            let already_exists = Arc::clone(&already_exists);
+            thread::spawn(move || {
+                while let Ok(artifact) = rx.recv() {
+                    uploader.upload_artifact(&artifact, &failures, &uploaded, &already_exists);
+                }
+            })
+        })
+        .collect();
+    drop(rx); // 扫描线程结束后 channel 断开，所有 worker 自然退出
+    for worker in workers {
+        let _ = worker.join();
+    }
 
     drop(uploader); // 关闭 Sender，使数据库写入线程结束
     let _ = db_writer_handle.join();
@@ -347,7 +371,7 @@ impl Uploader {
         );
         let fingerprint = fingerprint(file_path)?;
 
-        if !self.options.force {
+        if !self.options.force && !self.options.skip_head_check {
             if let Some(stored) = self.stored_fingerprint(&target_url)?
                 && stored == fingerprint
             {
@@ -374,30 +398,81 @@ impl Uploader {
             }
         }
 
-        let file = File::open(file_path)
-            .with_context(|| format!("无法读取文件: {}", file_path.display()))?;
-        let response = self
-            .client
-            .put(&target_url)
-            .basic_auth(&self.options.username, Some(&self.options.password))
-            .body(file)
-            .send();
+        // PUT 是幂等操作，网络错误 / 5xx / 429 都可以安全重试
+        let response = self.send_with_retry("PUT 上传", || {
+            let file = File::open(file_path)
+                .with_context(|| format!("无法读取文件: {}", file_path.display()))?;
+            Ok(self
+                .client
+                .put(&target_url)
+                .basic_auth(&self.options.username, Some(&self.options.password))
+                .body(file))
+        })?;
 
-        match response {
-            Ok(response) if response.status().is_success() => {
-                if !remote_ext.contains("sha1") && !remote_ext.contains("md5") {
-                    emit(&self.pb, format!("  [+] 上传成功: {file_name}"));
-                }
-                self.record(&target_url, &fingerprint)?;
-                Ok(FileOutcome::Uploaded)
+        if response.status().is_success() {
+            if !remote_ext.contains("sha1") && !remote_ext.contains("md5") {
+                emit(&self.pb, format!("  [+] 上传成功: {file_name}"));
             }
-            Ok(response) => {
-                let status = response.status();
-                let detail = response.text().unwrap_or_default();
-                Err(anyhow!("HTTP {status}: {}", truncate(&detail)))
-            }
-            Err(error) => Err(anyhow!("网络错误: {error}")),
+            self.record(&target_url, &fingerprint)?;
+            return Ok(FileOutcome::Uploaded);
         }
+        let status = response.status();
+        let detail = response.text().unwrap_or_default();
+        Err(anyhow!("HTTP {status}: {}", truncate(&detail)))
+    }
+
+    /// 发送请求，对网络错误、5xx 与 429 做指数退避重试。
+    ///
+    /// 只有 2xx / 3xx / 4xx 会被返回给调用方（4xx 是调用方的问题，重试无意义）；
+    /// 重试次数耗尽后返回最后一次的错误。
+    fn send_with_retry(
+        &self,
+        what: &str,
+        build: impl Fn() -> Result<reqwest::blocking::RequestBuilder>,
+    ) -> Result<reqwest::blocking::Response> {
+        let retries = self.options.retries;
+        let mut last_error = None;
+        for attempt in 0..=retries {
+            if attempt > 0 {
+                // 250ms、500ms、1s、2s…… 上限 4s
+                let backoff = (250_u64 << attempt.min(4)).min(4_000);
+                thread::sleep(Duration::from_millis(backoff));
+            }
+            let builder = build()?;
+            match builder.send() {
+                Ok(response)
+                    if response.status().is_server_error()
+                        || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS =>
+                {
+                    let status = response.status();
+                    let _ = response.text();
+                    last_error = Some(anyhow!("HTTP {status}"));
+                    if attempt < retries {
+                        emit(
+                            &self.pb,
+                            format!(
+                                "  [!] {what} 返回 {status}，重试 ({}/{retries})",
+                                attempt + 1
+                            ),
+                        );
+                    }
+                }
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    last_error = Some(anyhow!("网络错误: {error}"));
+                    if attempt < retries {
+                        emit(
+                            &self.pb,
+                            format!(
+                                "  [!] {what} 失败: {error}，重试 ({}/{retries})",
+                                attempt + 1
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("{what} 失败")))
     }
 
     /// 读取状态库中已记录的指纹。

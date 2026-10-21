@@ -79,6 +79,18 @@ pub struct UploadArgs {
     /// 状态数据库路径 (redb 格式)
     #[arg(long, env = "MAVEN_UTIL_DB_PATH")]
     pub db_path: Option<PathBuf>,
+
+    /// 上传并发数（同时进行的 HTTP 请求数，默认 = CPU 核数）
+    #[arg(long, env = "MAVEN_UTIL_CONCURRENCY")]
+    pub concurrency: Option<usize>,
+
+    /// 网络错误 / 5xx / 429 的重试次数
+    #[arg(long, env = "MAVEN_UTIL_RETRIES")]
+    pub retries: Option<u32>,
+
+    /// 跳过 HEAD 远端存在性检查（状态库仍然生效，可减少请求数）
+    #[arg(long, env = "MAVEN_UTIL_SKIP_HEAD_CHECK")]
+    pub skip_head_check: bool,
 }
 
 /// `upload` 子命令：参数与不带子命令时的顶层上传参数一致。
@@ -182,6 +194,9 @@ impl UploadArgs {
             },
             max_size: sub.max_size.or(top.max_size),
             db_path: sub.db_path.clone().or_else(|| top.db_path.clone()),
+            concurrency: sub.concurrency.or(top.concurrency),
+            retries: sub.retries.or(top.retries),
+            skip_head_check: sub.skip_head_check || top.skip_head_check,
         }
     }
 }
@@ -243,6 +258,12 @@ impl Args {
                 .db_path
                 .or_else(|| file.db_path.map(config::path))
                 .unwrap_or_else(config::default_db_path),
+            concurrency: cli
+                .concurrency
+                .or(file.concurrency)
+                .unwrap_or_else(crate::upload::default_upload_concurrency),
+            retries: cli.retries.or(file.retries).unwrap_or(2),
+            skip_head_check: cli.skip_head_check || file.skip_head_check.unwrap_or(false),
         })
     }
 

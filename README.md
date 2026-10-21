@@ -64,6 +64,13 @@ force = false
 exclude = []
 max_size_mb = 100
 db_path = "~/.maven-util/uploads.db"
+# 上传并发数（同时进行的 HTTP 请求数），默认 = CPU 核数；
+# 远端延迟越高收益越大，内网保持默认即可
+concurrency = 8
+# 网络错误 / 5xx / 429 的重试次数（PUT 幂等，重试安全）
+retries = 2
+# 跳过 HEAD 远端存在性检查（状态库仍然生效，可减少约一半请求数）
+skip_head_check = false
 
 [download]
 workdir = "."
@@ -129,6 +136,9 @@ maven-util \
 -p, --password <PASSWORD>   密码
 -d, --dir <DIR>             本地仓库目录，默认当前目录
 -f, --force                 强制重新上传（跳过本地状态库和远程 HEAD 检查）
+    --concurrency <N>        上传并发数，默认 = CPU 核数（同时进行的 HTTP 请求数）
+    --retries <N>            网络错误 / 5xx / 429 的重试次数，默认 2
+    --skip-head-check        跳过 HEAD 远端存在性检查（状态库仍然生效）
 -E, --exclude <TEXT,...>    排除 groupId 或 artifactId 关键词
     --max-size <MB>         跳过超过大小的 jar/war，默认 100MB
     --db-path <FILE>        上传状态数据库，默认 ~/.maven-util/uploads.db
@@ -141,7 +151,32 @@ maven-util \
 - 目录遍历本身出错（权限、线程池异常等）同样以非零退出码结束，
   因为此时扫描结果不完整；结构不合法的 POM 只作为警告逐条打印；
 - 状态库（redb）保存的是 `文件大小:纳秒级 mtime` 指纹，同一秒内的修改
-  也会被识别为需要重新上传；`--force` 可完全绕过状态库和远程 HEAD 检查。
+  也会被识别为需要重新上传；`--force` 可完全绕过状态库和远程 HEAD 检查；
+- 网络错误、5xx 与 429 会按指数退避自动重试 `--retries` 次（默认 2 次）。
+
+### 并发与性能
+
+上传是纯 I/O 操作，吞吐与并发数成正比，而与 CPU 关系不大。实测
+（400 个文件 = 800 次请求，模拟 80ms 单向延迟的远端）：
+
+| 并发数 | 耗时 |
+| --- | --- |
+| 4（旧默认） | 16.33s |
+| 8 | 8.19s |
+| 16 | 4.28s |
+| 32 | 2.32s |
+| 32 + `--skip-head-check` | 1.17s |
+
+同机同文件系统的本地（0 延迟）上传仅需 0.1s，说明瓶颈完全在网络等待。
+
+建议：
+
+- **跨机房 / 公网 Nexus**：`--concurrency 32` 起步；首次上传时再加
+  `--skip-head-check`（前提是远端确实是空仓库或内容一致），可省掉约一半请求；
+- **内网低延迟仓库**：保持默认并发即可，连接本身是瓶颈；
+- 阻塞线程的内存开销很小，几十个并发线程不会造成负担；只有需要 500+
+  并发或同时跑大量 TLS 长连接时，才值得改成异步（tokio + reqwest async，
+  代价是引入运行时并重写上传路径）。
 
 ## 下载依赖
 

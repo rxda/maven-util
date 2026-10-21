@@ -39,16 +39,22 @@ impl Default for HttpSettings {
 impl HttpSettings {
     /// 普通请求客户端（带 `request_timeout`）。
     pub fn standard_client(&self) -> Result<Client> {
-        build_client(self, self.request_timeout)
+        build_client(self, self.request_timeout, 4)
     }
 
     /// 上传客户端（带更宽松的 `upload_timeout`，允许上传较大的构件）。
-    pub fn upload_client(&self) -> Result<Client> {
-        build_client(self, self.upload_timeout)
+    ///
+    /// 连接池按上传并发预留：高并发上传时避免反复重建 TCP/TLS 连接。
+    pub fn upload_client(&self, concurrency: usize) -> Result<Client> {
+        build_client(self, self.upload_timeout, concurrency.clamp(4, 128))
     }
 }
 
-fn build_client(settings: &HttpSettings, request_timeout: Duration) -> Result<Client> {
+fn build_client(
+    settings: &HttpSettings,
+    request_timeout: Duration,
+    pool_max_idle_per_host: usize,
+) -> Result<Client> {
     // 1. 初始化纯 Rust 的加密提供者 (RustCrypto)，替代默认的 ring 或 aws-lc-rs
     let provider = rustls_rustcrypto::provider();
 
@@ -68,7 +74,7 @@ fn build_client(settings: &HttpSettings, request_timeout: Duration) -> Result<Cl
         .use_preconfigured_tls(tls_config)
         .connect_timeout(settings.connect_timeout)
         .timeout(request_timeout)
-        .pool_max_idle_per_host(4)
+        .pool_max_idle_per_host(pool_max_idle_per_host)
         .user_agent(concat!("maven-util/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("无法构建 reqwest 客户端")?;
