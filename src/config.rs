@@ -324,7 +324,8 @@ db_path = "~/.maven-util/uploads.db"
 concurrency = 8
 # 网络错误 / 5xx / 429 的重试次数（PUT 幂等，重试安全）
 retries = 2
-# 跳过 HEAD 远端存在性检查（状态库仍然生效，可减少约一半请求数）
+# 跳过 HEAD 存在性检查（状态库仍生效）。仅当远端尚无这些文件时才更快；
+# 远端已有内容时会全量重传，并会覆盖上传本地已改动的构件
 skip_head_check = false
 
 [download]

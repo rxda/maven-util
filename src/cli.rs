@@ -88,7 +88,7 @@ pub struct UploadArgs {
     #[arg(long, env = "MAVEN_UTIL_RETRIES")]
     pub retries: Option<u32>,
 
-    /// 跳过 HEAD 远端存在性检查（状态库仍然生效，可减少请求数）
+    /// 跳过 HEAD 存在性检查（状态库仍生效；仅远端尚无内容时才更快）
     #[arg(long, env = "MAVEN_UTIL_SKIP_HEAD_CHECK")]
     pub skip_head_check: bool,
 }
