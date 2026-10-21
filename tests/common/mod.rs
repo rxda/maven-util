@@ -23,6 +23,12 @@ pub enum Reply {
     MethodStatus { head: u16, other: u16 },
     /// 指定状态码 + JSON 响应体（用于 Components API 的存在性查询）
     Json(u16, String),
+    /// 存在性查询：**按 query 里的 group/name/version 真正过滤**，只返回精确命中的组件。
+    ///
+    /// 刻意不返回「仓库内全部组件」——真实 Nexus 的 `/components` 端点就是这么干的
+    /// （忽略坐标过滤参数），它曾让「响应非空 = 目标已存在」的判断静默漏传。
+    /// 测试夹具必须还原真实语义，否则测不到这类问题。
+    ComponentQuery(Vec<serde_json::Value>),
     /// PUT 前 N 次返回失败状态码、之后成功（用于重试测试）；HEAD 恒为 404。
     FlakyPut {
         counter: Arc<AtomicUsize>,
@@ -215,6 +221,47 @@ fn handle(
         Some(Reply::Json(code, body)) => {
             let reason = if *code == 200 { "OK" } else { "Status" };
             reply(*code, reason, body.as_bytes(), &method)
+        }
+        Some(Reply::ComponentQuery(components)) => {
+            // 从完整请求行里取 query（path 变量已把 ? 之后截掉了）
+            let full_path = text
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or_default();
+            let query = full_path
+                .split_once('?')
+                .map(|(_, q)| q)
+                .unwrap_or_default();
+            let param = |key: &str| -> String {
+                query
+                    .split('&')
+                    .find_map(|pair| {
+                        let (name, value) = pair.split_once('=')?;
+                        (name == key).then(|| value.to_string())
+                    })
+                    .unwrap_or_default()
+            };
+            let group = param("group");
+            let name = param("name");
+            let version = param("version");
+            // 三个坐标都给了才做过滤；否则退化成返回全部（模拟「过滤被忽略」）
+            let matched: Vec<&serde_json::Value> =
+                if !group.is_empty() && !name.is_empty() && !version.is_empty() {
+                    components
+                        .iter()
+                        .filter(|item| {
+                            item.get("group").and_then(|v| v.as_str()) == Some(group.as_str())
+                                && item.get("name").and_then(|v| v.as_str()) == Some(name.as_str())
+                                && item.get("version").and_then(|v| v.as_str())
+                                    == Some(version.as_str())
+                        })
+                        .collect()
+                } else {
+                    components.iter().collect()
+                };
+            let body = serde_json::json!({"items": matched}).to_string();
+            reply(200, "OK", body.as_bytes(), &method)
         }
         Some(Reply::Status(code)) => {
             let reason = match code {

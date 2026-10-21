@@ -80,15 +80,16 @@ impl ComponentsTarget {
         format!("{}/service/rest/v1/components", self.base_url)
     }
 
-    /// 存在性查询端点（带 repository/group/name/version 过滤）。
+    /// 存在性查询端点（按坐标精确过滤）。
+    ///
+    /// 用 `/service/rest/v1/search` 而**不是** `/service/rest/v1/components`：
+    /// 后者的 `group`/`name`/`version` 查询参数在真实 Nexus 上被忽略，
+    /// 始终返回仓库内全部组件，据「响应非空」判断目标是否存在会静默漏传。
+    /// （实测 Nexus Community 3.85.0；search 端点过滤正确。）
     pub fn query_url(&self, group_id: &str, artifact_id: &str, version: &str) -> String {
         format!(
-            "{}?repository={}&group={}&name={}&version={}",
-            self.components_url(),
-            self.repository,
-            group_id,
-            artifact_id,
-            version
+            "{}/service/rest/v1/search?repository={}&group={}&name={}&version={}",
+            self.base_url, self.repository, group_id, artifact_id, version
         )
     }
 }
@@ -213,11 +214,42 @@ pub fn build_form(artifact: &MavenArtifact, assets: &[ComponentAsset]) -> Result
     Ok(form)
 }
 
-/// Components 查询返回的分页结构（只关心 `items` 是否为空）。
+/// 组件查询返回的分页结构（只关心 `items` 是否为空）。
 #[derive(Debug, Deserialize)]
 struct ComponentsPage {
     #[serde(default)]
     items: Vec<serde_json::Value>,
+}
+
+/// 校验一次存在性查询的结果是否可信。
+///
+/// search 端点若把坐标过滤丢了（返回仓库内全部组件），
+/// 「items 非空」就会被误判成「目标已存在」而静默漏传，
+/// 因此这里显式核对返回项里确实包含目标坐标。
+fn response_contains_artifact(page: &ComponentsPage, artifact: &MavenArtifact) -> Result<bool> {
+    let hit = page.items.iter().any(|item| {
+        let field = |key: &str| {
+            item.get(key)
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+        };
+        field("group") == artifact.group_id
+            && field("name") == artifact.artifact_id
+            && field("version") == artifact.version
+    });
+    if !hit && !page.items.is_empty() {
+        emit_warning(artifact, page.items.len());
+    }
+    Ok(hit)
+}
+
+fn emit_warning(artifact: &MavenArtifact, returned: usize) {
+    // 服务端返回了别的组件却没返回目标，说明它忽略了坐标过滤参数
+    eprintln!(
+        "  [!] 存在性查询返回 {returned} 个其他组件，但不含坐标 {}:{}:{}。\
+         服务端可能忽略了过滤参数，为避免漏传继续提交",
+        artifact.group_id, artifact.artifact_id, artifact.version
+    );
 }
 
 /// 查询远端是否已存在同坐标的组件。
@@ -237,8 +269,8 @@ pub fn component_exists(
     if !response.status().is_success() {
         return Err(anyhow!("查询组件返回 HTTP {}", response.status()));
     }
-    let page: ComponentsPage = response.json().context("无法解析 Components 查询响应")?;
-    Ok(!page.items.is_empty())
+    let page: ComponentsPage = response.json().context("无法解析组件查询响应")?;
+    response_contains_artifact(&page, artifact)
 }
 
 #[cfg(test)]
@@ -314,7 +346,8 @@ mod tests {
         );
         assert_eq!(
             target.query_url("org.example", "demo", "1.0"),
-            "https://nexus.example.com/service/rest/v1/components?repository=maven-releases&group=org.example&name=demo&version=1.0"
+            "https://nexus.example.com/service/rest/v1/search?repository=maven-releases&group=org.example&name=demo&version=1.0",
+            "存在性查询必须走 /search：/components 的坐标过滤参数在真实 Nexus 上被忽略"
         );
         assert!(ComponentsTarget::from_base_and_repository("https://x/", "").is_err());
         assert!(ComponentsTarget::from_base_and_repository("ftp://x/", "r").is_err());
@@ -348,6 +381,47 @@ mod tests {
             ],
             "应跳过全部校验和文件，并解析出 classifier；结果按路径排序（`-` < `.`）"
         );
+    }
+
+    #[test]
+    fn ignores_query_response_that_lost_the_coordinate_filter() {
+        // 服务端把坐标过滤丢掉时会返回仓库内全部组件；
+        // 若直接按「items 非空」判断，目标会被误判为已存在而静默漏传。
+        let target =
+            ComponentsTarget::from_base_and_repository("https://nexus.example.com", "r").unwrap();
+        assert!(!target.repository.is_empty());
+
+        let artifact = MavenArtifact {
+            group_id: "org.example".into(),
+            artifact_id: "demo".into(),
+            version: "1.0".into(),
+            files: vec![],
+        };
+
+        let unrelated = serde_json::json!({
+            "items": [
+                {"group": "com.other", "name": "thing", "version": "9.9"},
+                {"group": "org.example", "name": "demo", "version": "0.1"},
+            ]
+        });
+        let page: ComponentsPage = serde_json::from_value(unrelated).unwrap();
+        assert!(
+            !response_contains_artifact(&page, &artifact).unwrap(),
+            "返回的都是别的坐标，不能当作目标已存在"
+        );
+
+        let exact = serde_json::json!({
+            "items": [{"group": "org.example", "name": "demo", "version": "1.0"}]
+        });
+        let page: ComponentsPage = serde_json::from_value(exact).unwrap();
+        assert!(
+            response_contains_artifact(&page, &artifact).unwrap(),
+            "坐标完全匹配才算已存在"
+        );
+
+        let empty = serde_json::json!({"items": []});
+        let page: ComponentsPage = serde_json::from_value(empty).unwrap();
+        assert!(!response_contains_artifact(&page, &artifact).unwrap());
     }
 
     #[test]

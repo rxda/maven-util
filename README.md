@@ -209,7 +209,7 @@ maven-util upload --mode components -U https://nexus.example.com/repository/mave
 | 请求数 | 文件数 × 2 | 构件数 |
 | 适用范围 | 任何 Maven 布局仓库 | 仅 Nexus 3 |
 | 校验和 | 本地算并上传 `.sha1`/`.md5` | 服务端计算，本地校验和文件不上传 |
-| 存在性检查 | 逐文件 HEAD | 按坐标查询一次组件 |
+| 存在性检查 | 逐文件 HEAD | 按坐标查询一次 `/search` |
 | 失败粒度 | 单文件 | 整个构件（重传时全部资产一起重传） |
 | classifier | 隐含在文件名 | 显式 `maven2.assetN.classifier` 字段 |
 | 状态库指纹 | 按文件 | 按组件（任一资产变化 → 整组件重传） |
@@ -223,6 +223,11 @@ maven-util upload --mode components -U https://nexus.example.com/repository/mave
   服务端会自己算。这与 PUT 模式不同——PUT 模式必须把它们一起传上去。
 - 失败重试是整构件级别的（`--retries` 同样生效），单个资产失败会导致整个
   构件下次重传。
+- **存在性查询走 `/service/rest/v1/search` 而非 `/service/rest/v1/components`。**
+  实测 Nexus Community 3.85.0 的 `/components` 端点会忽略 `group`/`name`/`version`
+  查询参数、始终返回仓库内全部组件；若按「响应非空」判断，新构件会被误判为
+  已存在而静默跳过（进程仍退出 0）。`/search` 的坐标过滤是正确的。即便如此，
+  实现仍会核对返回项里确实包含目标坐标，否则继续提交。
 
 ## 下载依赖
 

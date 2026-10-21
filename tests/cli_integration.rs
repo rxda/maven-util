@@ -750,12 +750,21 @@ fn skip_head_check_uploads_even_when_remote_exists() {
     std::fs::remove_dir_all(&second_home).ok();
 }
 
-/// Components 模式的路由：查询接口按方法区分（GET 查存在性、POST 提交）。
-fn components_routes(query_items: &str, post_status: u16) -> HashMap<String, Reply> {
+/// Components 模式的路由：查询走 `/search`（按坐标真正过滤）、提交走 `/components`。
+///
+/// `present` 里的坐标会被查询端点命中；仓库里其余组件不会被返回，
+/// 因此「新构件是否被误判为已存在」能被这类测试抓住。
+fn components_routes(present: &[(&str, &str, &str)], post_status: u16) -> HashMap<String, Reply> {
+    let items: Vec<serde_json::Value> = present
+        .iter()
+        .map(|(group, name, version)| {
+            serde_json::json!({"group": group, "name": name, "version": version})
+        })
+        .collect();
     let mut routes = HashMap::new();
     routes.insert(
-        "GET /service/rest/v1/components".to_string(),
-        Reply::Json(200, format!("{{\"items\":{query_items}}}")),
+        "GET /service/rest/v1/search".to_string(),
+        Reply::ComponentQuery(items),
     );
     routes.insert(
         "POST /service/rest/v1/components".to_string(),
@@ -770,7 +779,7 @@ fn components_mode_submits_single_multipart_request() {
     let home = temp_dir("home-components");
     let repo = repo_with_artifact("repo-components");
     // 远端查询返回空（组件不存在）→ 应提交；提交返回 204
-    let upstream = FakeUpstream::start(components_routes("[]", 204));
+    let upstream = FakeUpstream::start(components_routes(&[], 204));
     let url = format!("{}/repository/maven-releases", upstream.base_url);
 
     let output = run(
@@ -841,7 +850,7 @@ fn components_mode_submits_single_multipart_request() {
 fn components_mode_sends_classifier_and_skips_checksums() {
     let home = temp_dir("home-components-cl");
     let repo = repo_with_extras("repo-components-cl");
-    let upstream = FakeUpstream::start(components_routes("[]", 204));
+    let upstream = FakeUpstream::start(components_routes(&[], 204));
     let url = format!("{}/repository/maven-releases", upstream.base_url);
 
     let output = run(
@@ -899,10 +908,7 @@ fn components_mode_sends_classifier_and_skips_checksums() {
 fn components_mode_skips_existing_component() {
     let home = temp_dir("home-components-exists");
     let repo = repo_with_artifact("repo-components-exists");
-    let upstream = FakeUpstream::start(components_routes(
-        "[{\"id\":\"abc\",\"group\":\"org.example\",\"name\":\"demo\",\"version\":\"1.0\"}]",
-        204,
-    ));
+    let upstream = FakeUpstream::start(components_routes(&[("org.example", "demo", "1.0")], 204));
     let url = format!("{}/repository/maven-releases", upstream.base_url);
 
     let output = run(
@@ -950,7 +956,7 @@ fn components_mode_retries_then_fails() {
     let home = temp_dir("home-components-retry");
     let repo = repo_with_artifact("repo-components-retry");
     let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut routes = components_routes("[]", 204);
+    let mut routes = components_routes(&[], 204);
     routes.insert(
         "POST /service/rest/v1/components".to_string(),
         Reply::FlakyPut {
@@ -1001,12 +1007,74 @@ fn components_mode_retries_then_fails() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// 回归：仓库里已有别的组件时，新构件不得被误判为「远端已存在」。
+///
+/// 真实 Nexus 的 `/components` 端点会忽略坐标过滤参数、返回仓库内全部组件。
+/// 若实现只看「响应非空」，新构件会被静默跳过且进程退出 0（数据丢失级 bug）。
+/// 因此查询端点必须走 `/search`，且夹具会真正按坐标过滤。
+#[test]
+fn components_mode_does_not_skip_new_artifact_among_existing_ones() {
+    let home = temp_dir("home-components-mixed");
+    let repo = repo_with_artifact("repo-components-mixed");
+    // 仓库里已经有 org.example:demo:1.0（正是本次要传的坐标）——但换个场景：
+    // 这里放一个「别的」坐标，模拟远端已有其他构件。
+    let upstream = FakeUpstream::start(components_routes(
+        &[("com.other", "already-there", "9.9.9")],
+        204,
+    ));
+    let url = format!("{}/repository/maven-releases", upstream.base_url);
+
+    let output = run(
+        &[
+            "upload",
+            "--url",
+            &url,
+            "--username",
+            "admin",
+            "--password",
+            "secret",
+            "--dir",
+            repo.to_str().unwrap(),
+            "--db-path",
+            repo.join("state.db").to_str().unwrap(),
+            "--mode",
+            "components",
+        ],
+        &home,
+        None,
+    );
+
+    assert!(output.status.success(), "{}", combined(&output));
+    let message = combined(&output);
+    assert!(
+        !message.contains("远端已存在"),
+        "远端只有别的坐标，不应判定目标已存在：{message}"
+    );
+    assert!(
+        message.contains("提交成功"),
+        "新构件必须真正提交：{message}"
+    );
+    assert_eq!(
+        upstream
+            .requests()
+            .iter()
+            .filter(|request| request.starts_with("POST /service/rest/v1/components"))
+            .count(),
+        1,
+        "应发出一次提交请求：{:?}",
+        upstream.requests()
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// Components 模式：URL 中没有 /repository/<名> 时给出可操作的报错。
 #[test]
 fn components_mode_rejects_url_without_repository_segment() {
     let home = temp_dir("home-components-badurl");
     let repo = repo_with_artifact("repo-components-badurl");
-    let upstream = FakeUpstream::start(components_routes("[]", 204));
+    let upstream = FakeUpstream::start(components_routes(&[], 204));
 
     let output = run(
         &[
